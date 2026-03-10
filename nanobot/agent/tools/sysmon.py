@@ -166,7 +166,7 @@ class SysmonTool(Tool):
                     vram_total = int(info.get("VRAM Total Memory (B)", 0)) // 1024 // 1024
                     results.append(
                         f"GPU (ROCm) AMD Radeon RX 480: {util}% util | "
-                        f"VRAM {vram_used}/{vram_total} MB | Temp {temp}°C"
+                        f"VRAM {vram_used / 1024:.1f}/{vram_total / 1024:.1f} GB | Temp {temp}°C"
                     )
         except FileNotFoundError:
             results.append("GPU (ROCm): rocm-smi not found")
