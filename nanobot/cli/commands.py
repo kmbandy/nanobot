@@ -323,7 +323,7 @@ def gateway(
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
-      agent = AgentLoop(
+    agent = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
@@ -345,6 +345,9 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         cf_crawl_config=config.tools.cf_crawl,
+        memory_max_chars=config.agents.defaults.memory_max_chars,
+        memory_max_tokens=config.agents.defaults.memory_max_tokens,
+        memory_compaction_enabled=config.agents.defaults.memory_compaction_enabled,
     )
 
     # Set cron callback (needs agent)
@@ -533,6 +536,9 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         cf_crawl_config=config.tools.cf_crawl,
+        memory_max_chars=config.agents.defaults.memory_max_chars,
+        memory_max_tokens=config.agents.defaults.memory_max_tokens,
+        memory_compaction_enabled=config.agents.defaults.memory_compaction_enabled,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
