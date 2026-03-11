@@ -73,6 +73,9 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         cf_crawl_config: CfCrawlConfig | None = None,
+        memory_max_chars: int = 8000,
+        memory_max_tokens: int = 2000,
+        memory_compaction_enabled: bool = True,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -93,8 +96,19 @@ class AgentLoop:
         self.nvidia_default_model = nvidia_default_model
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.memory_max_chars = memory_max_chars
+        self.memory_max_tokens = memory_max_tokens
+        self.memory_compaction_enabled = memory_compaction_enabled
 
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(
+            workspace=workspace,
+            provider=provider,
+            model=self.model,
+            memory_max_chars=memory_max_chars,
+            memory_max_tokens=memory_max_tokens,
+            memory_compaction_enabled=memory_compaction_enabled,
+            temperature=self.temperature,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -366,7 +380,7 @@ class AgentLoop:
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
-            messages = self.context.build_messages(
+            messages = await self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
@@ -440,7 +454,7 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=self.memory_window)
-        initial_messages = self.context.build_messages(
+        initial_messages = await self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,

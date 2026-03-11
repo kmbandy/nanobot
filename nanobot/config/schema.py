@@ -232,6 +232,9 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     memory_window: int = 100
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    memory_max_chars: int = 8000
+    memory_max_tokens: int = 2000
+    memory_compaction_enabled: bool = True
 
 
 class AgentsConfig(Base):
