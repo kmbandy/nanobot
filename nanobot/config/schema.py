@@ -294,6 +294,13 @@ class WebSearchConfig(Base):
     searxng_url: str = ""  # SearXNG instance URL, e.g. "http://localhost:8888"
 
 
+class NvidiaConfig(Base):
+    """NVIDIA API configuration for model escalation."""
+
+    api_key: str = ""
+    default_model: str = "meta/llama-3.1-nemotron-ultra-253b-v1"
+
+
 class WebToolsConfig(Base):
     """Web tools configuration."""
 
@@ -327,6 +334,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    nvidia: NvidiaConfig = Field(default_factory=NvidiaConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
