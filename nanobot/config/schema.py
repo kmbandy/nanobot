@@ -295,6 +295,13 @@ class WebSearchConfig(Base):
     searxng_url: str = ""  # SearXNG instance URL, e.g. "http://localhost:8888"
 
 
+class NvidiaConfig(Base):
+    """NVIDIA API configuration for model escalation."""
+
+    api_key: str = ""
+    default_model: str = "meta/llama-3.1-nemotron-ultra-253b-v1"
+
+
 class WebToolsConfig(Base):
     """Web tools configuration."""
 
@@ -321,13 +328,6 @@ class MCPServerConfig(Base):
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
-
-
-class NvidiaConfig(Base):
-    """NVIDIA hosted model configuration."""
-
-    api_key: str = ""
-    default_model: str = "nvidia/llama-3.1-nemotron-ultra-253b-v1"
 
 
 class ToolsConfig(Base):

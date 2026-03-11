@@ -22,8 +22,8 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.nvidia_escalate import NvidiaEscalateTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.nvidia_escalate import NvidiaEscalateTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -62,9 +62,9 @@ class AgentLoop:
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         searxng_url: str | None = None,
+        exec_config: ExecToolConfig | None = None,
         nvidia_api_key: str | None = None,
         nvidia_default_model: str | None = None,
-        exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -85,9 +85,9 @@ class AgentLoop:
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.searxng_url = searxng_url
-        self.nvidia_api_key = nvidia_api_key or ''
-        self.nvidia_default_model = nvidia_default_model or 'nvidia/llama-3.1-nemotron-ultra-253b-v1'
         self.exec_config = exec_config or ExecToolConfig()
+        self.nvidia_api_key = nvidia_api_key
+        self.nvidia_default_model = nvidia_default_model
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
@@ -135,9 +135,9 @@ class AgentLoop:
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy, searxng_url=self.searxng_url))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(SysmonTool())
-        self.tools.register(NvidiaEscalateTool(api_key=self.nvidia_api_key, default_model=self.nvidia_default_model))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(NvidiaEscalateTool(api_key=self.nvidia_api_key or '', default_model=self.nvidia_default_model or 'meta/llama-3.1-nemotron-ultra-253b-v1'))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
