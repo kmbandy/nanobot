@@ -21,9 +21,11 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.config.schema import CfCrawlConfig
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.agent.tools.nvidia_escalate import NvidiaEscalateTool
+from nanobot.agent.tools.cf_crawl import CfCrawlTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -70,6 +72,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        cf_crawl_config: CfCrawlConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -119,6 +122,7 @@ class AgentLoop:
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
+        self.cf_crawl_config = cf_crawl_config
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -138,6 +142,7 @@ class AgentLoop:
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(NvidiaEscalateTool(api_key=self.nvidia_api_key or '', default_model=self.nvidia_default_model or 'meta/llama-3.1-nemotron-ultra-253b-v1'))
+        self.tools.register(CfCrawlTool(config=self.cf_crawl_config))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 

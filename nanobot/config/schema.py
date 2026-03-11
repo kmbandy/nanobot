@@ -301,6 +301,14 @@ class NvidiaConfig(Base):
     default_model: str = "meta/llama-3.1-nemotron-ultra-253b-v1"
 
 
+class CfCrawlConfig(Base):
+    """Cloudflare Browser Rendering / Crawl API configuration."""
+
+    api_token: str = ""  # Cloudflare API token
+    account_id: str = ""  # Cloudflare account ID
+    base_url: str = "https://api.cloudflare.com/client/v4"
+
+
 class WebToolsConfig(Base):
     """Web tools configuration."""
 
@@ -335,6 +343,7 @@ class ToolsConfig(Base):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     nvidia: NvidiaConfig = Field(default_factory=NvidiaConfig)
+    cf_crawl: CfCrawlConfig = Field(default_factory=CfCrawlConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
