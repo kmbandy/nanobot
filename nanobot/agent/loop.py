@@ -159,7 +159,7 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(NvidiaEscalateTool(
             api_key=self.nvidia_api_key or '',
-            default_model=self.nvidia_default_model or 'meta/llama-3.1-nemotron-ultra-253b-v1',
+            default_model=self.nvidia_default_model or 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
         ))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))

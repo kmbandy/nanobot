@@ -270,6 +270,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
         return messages
 
+    # Maximum length for a single tool call argument value stored in message
+    # history. Large values cause the Qwen Jinja template to render enormous
+    # <tool_call> XML blocks that make llama-server fail to parse the input.
+    _TOOL_ARG_MAX_CHARS = 300
+
     def add_assistant_message(
         self, messages: list[dict[str, Any]],
         content: str | None,
@@ -278,40 +283,43 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
         """Add an assistant message to the message list.
-        
-        When tool_calls are present, store a human-readable summary in content
-        and omit the tool_calls field to prevent Jinja template XML rendering
-        issues with llama-server.
+
+        When tool_calls are present, argument values longer than
+        _TOOL_ARG_MAX_CHARS are truncated before storing.  This keeps the
+        tool_calls field intact (so the role:tool chain stays valid) while
+        preventing the Qwen Jinja template from rendering multi-KB
+        <tool_call> XML blocks that cause llama-server parse failures.
         """
-        # If tool calls are present, format them as a human-readable summary
-        # and omit the tool_calls field entirely
         final_content = content
-        final_tool_calls = None
-        
+        final_tool_calls = tool_calls
+
         if tool_calls:
-            # Format tool calls as a concise summary
-            hints = []
+            truncated = []
             for tc in tool_calls:
-                fn = tc.get("function", {})
-                name = fn.get("name", tc.get("name", "tool"))
-                args = fn.get("arguments", tc.get("arguments", ""))
-                if isinstance(args, str):
-                    # Extract first argument value for display
-                    try:
-                        parsed = json.loads(args)
-                        val = next(iter(parsed.values()), "") if isinstance(parsed, dict) else str(args)[:40]
-                        if isinstance(val, str) and len(val) > 40:
-                            val = val[:40] + "…"
-                        hints.append(f"{name}(\"{val}\")")
-                    except (json.JSONDecodeError, Exception):
-                        hints.append(name)
-                else:
-                    hints.append(name)
-            
-            summary = ", ".join(hints) if hints else "tool call(s)"
-            final_content = f"Called tool(s): {summary}"
-            final_tool_calls = None  # Omit tool_calls field entirely
-        
+                tc_copy = dict(tc)
+                fn = tc_copy.get("function")
+                if isinstance(fn, dict):
+                    fn = dict(fn)
+                    args_str = fn.get("arguments", "{}")
+                    if isinstance(args_str, str) and len(args_str) > self._TOOL_ARG_MAX_CHARS:
+                        try:
+                            parsed = json.loads(args_str)
+                            if isinstance(parsed, dict):
+                                new_args = {
+                                    k: (v[:self._TOOL_ARG_MAX_CHARS] + "…[truncated]"
+                                        if isinstance(v, str) and len(v) > self._TOOL_ARG_MAX_CHARS
+                                        else v)
+                                    for k, v in parsed.items()
+                                }
+                                fn["arguments"] = json.dumps(new_args, ensure_ascii=False)
+                            else:
+                                fn["arguments"] = args_str[:self._TOOL_ARG_MAX_CHARS] + "…[truncated]"
+                        except (json.JSONDecodeError, Exception):
+                            fn["arguments"] = args_str[:self._TOOL_ARG_MAX_CHARS] + "…[truncated]"
+                    tc_copy["function"] = fn
+                truncated.append(tc_copy)
+            final_tool_calls = truncated
+
         messages.append(build_assistant_message(
             final_content,
             tool_calls=final_tool_calls,

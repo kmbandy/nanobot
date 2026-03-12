@@ -32,13 +32,7 @@ class NvidiaEscalateTool(Tool):
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model to use (optional, defaults to 253B)",
-                    "enum": [
-                        "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-                        "meta/llama-3.1-405b-instruct",
-                        "mistralai/mixtral-8x22b-instruct-v0.1",
-                        "nvidia/llama-3.3-nemotron-super-49b-v1"
-                    ]
+                    "description": "Model to use (optional, defaults to nvidia/llama-3.1-nemotron-ultra-253b-v1)"
                 },
                 "system_prompt": {
                     "type": "string",
@@ -100,7 +94,17 @@ class NvidiaEscalateTool(Tool):
                 logger.info("nvidia_escalate: HTTP {} from NVIDIA API", response.status_code)
                 response.raise_for_status()
                 result = response.json()
-                content = result["choices"][0]["message"]["content"]
+                msg = result["choices"][0]["message"]
+                content = msg.get("content")
+                # Nemotron Ultra (reasoning model) may return content=None with
+                # the answer in reasoning_content or reasoning fields.
+                if not content:
+                    content = (msg.get("reasoning_content")
+                               or msg.get("reasoning")
+                               or "")
+                if not content:
+                    logger.warning("nvidia_escalate: empty content in response, keys: {}", list(msg.keys()))
+                    return "nvidia_escalate: received empty response from model."
                 logger.info("nvidia_escalate: received {} chars from {}", len(content), selected_model)
                 return content
         except httpx.HTTPStatusError as e:
