@@ -5,6 +5,7 @@ from pathlib import Path
 
 from nanobot.config.schema import Config
 
+
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
 

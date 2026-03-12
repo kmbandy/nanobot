@@ -54,7 +54,6 @@ class QQChannel(BaseChannel):
     """QQ channel using botpy SDK with WebSocket connection."""
 
     name = "qq"
-    display_name = "QQ"
 
     def __init__(self, config: QQConfig, bus: MessageBus):
         super().__init__(config, bus)
