@@ -201,6 +201,22 @@ class AgentLoop:
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
 
     @staticmethod
+    def _truncate_tool_call_args(tool_call_dicts: list, max_chars: int = 300) -> list:
+        """Truncate large tool call arguments so the Jinja template doesn't render huge <tool_call> blocks."""
+        result = []
+        for tc in tool_call_dicts:
+            tc = dict(tc)
+            fn = tc.get("function")
+            if isinstance(fn, dict):
+                fn = dict(fn)
+                args = fn.get("arguments", "")
+                if isinstance(args, str) and len(args) > max_chars:
+                    fn["arguments"] = args[:max_chars] + "...[truncated]"
+                tc["function"] = fn
+            result.append(tc)
+        return result
+
+    @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
         def _fmt(tc):
@@ -244,8 +260,20 @@ class AgentLoop:
                     tc.to_openai_tool_call()
                     for tc in response.tool_calls
                 ]
+                # Truncate large tool call arguments before storing in messages.
+                # The Jinja chat template renders tool_calls as <tool_call> XML — if a
+                # tool argument contains a large document (e.g. nvidia_escalate task),
+                # the rendered prompt can be enormous and cause llama-server to 500.
+                tool_call_dicts = self._truncate_tool_call_args(tool_call_dicts)
+                # Never store raw tool call XML as assistant content — it poisons the
+                # next LLM call. In non-suppress mode the model may emit <tool_call> XML
+                # as response.content even when tool_calls are also parsed; storing that
+                # content causes llama-server to fail parsing at the <tool_call> tag.
+                suppress = getattr(self.provider, 'suppress_tools_param', False)
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
+                    messages,
+                    None,
+                    tool_call_dicts if not suppress else None,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
@@ -466,6 +494,11 @@ class AgentLoop:
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
+            if role == "assistant" and entry.get("tool_calls"):
+                # Drop raw XML content from assistant tool-call messages.
+                # In suppress mode the model emits <tool_call>...<parameter=task>[huge content]...
+                # which poisons session history and causes llama-server to fail on reload.
+                entry["content"] = None
             if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
                 entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
             elif role == "user":

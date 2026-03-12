@@ -1,6 +1,7 @@
 import httpx
 import os
 import re
+from loguru import logger
 from nanobot.agent.tools.base import Tool
 
 
@@ -63,9 +64,12 @@ class NvidiaEscalateTool(Tool):
 
         selected_model = model or self.default_model
 
-        # Strip XML tool call blocks that Qwen-style models may embed in task strings.
-        # Nemotron's vLLM endpoint processes <tool_call> tags during tokenization and will 500.
-        task = re.sub(r"<tool_call>.*?</tool_call>", "", task, flags=re.DOTALL).strip()
+        # Qwen-style models embed <tool_call> XML in task strings.
+        # Nemotron's vLLM endpoint chokes on these tags during tokenization.
+        # 1. Strip complete closed blocks
+        task = re.sub(r"<tool_call>.*?</tool_call>", "", task, flags=re.DOTALL)
+        # 2. Strip any unclosed <tool_call> block (runs to end of string)
+        task = re.sub(r"<tool_call>.*$", "", task, flags=re.DOTALL).strip()
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -84,17 +88,26 @@ class NvidiaEscalateTool(Tool):
             "max_tokens": 4096
         }
 
+        logger.debug("nvidia_escalate: task after sanitization (first 200 chars): {}", task[:200])
+        logger.info("nvidia_escalate: calling {} (task length: {} chars)", selected_model, len(task))
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=600.0) as client:
                 response = await client.post(
                     "https://integrate.api.nvidia.com/v1/chat/completions",
                     headers=headers,
                     json=payload
                 )
+                logger.info("nvidia_escalate: HTTP {} from NVIDIA API", response.status_code)
                 response.raise_for_status()
                 result = response.json()
-                return result["choices"][0]["message"]["content"]
+                content = result["choices"][0]["message"]["content"]
+                logger.info("nvidia_escalate: received {} chars from {}", len(content), selected_model)
+                return content
         except httpx.HTTPStatusError as e:
-            return f"API error: {response.status_code} - {response.text}"
+            # Don't return response.text — NVIDIA's error body echoes back the input,
+            # which may contain <tool_call> XML that will poison the next LLM call.
+            logger.error("nvidia_escalate: HTTP error {} - {}", response.status_code, response.text[:500])
+            return f"nvidia_escalate failed: HTTP {response.status_code} from NVIDIA API."
         except Exception as e:
-            return f"Error: {str(e)}"
+            logger.error("nvidia_escalate: unexpected error: {}", e)
+            return f"nvidia_escalate failed: {type(e).__name__}"

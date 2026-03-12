@@ -220,6 +220,17 @@ class LLMProvider(ABC):
                 delay,
                 err,
             )
+            try:
+                for _i, _m in enumerate(messages):
+                    _role = _m.get("role", "?")
+                    _content = str(_m.get("content") or "")
+                    _tc = _m.get("tool_calls")
+                    logger.info(
+                        "MSG[{}] role={} tool_calls={} content(first 300)={}",
+                        _i, _role, bool(_tc), _content[:300]
+                    )
+            except Exception:
+                pass
             await asyncio.sleep(delay)
 
         try:
