@@ -1,5 +1,6 @@
 import httpx
 import os
+import re
 from nanobot.agent.tools.base import Tool
 
 
@@ -32,7 +33,7 @@ class NvidiaEscalateTool(Tool):
                     "type": "string",
                     "description": "Model to use (optional, defaults to 253B)",
                     "enum": [
-                        "meta/llama-3.1-nemotron-ultra-253b-v1",
+                        "nvidia/llama-3.1-nemotron-ultra-253b-v1",
                         "meta/llama-3.1-405b-instruct",
                         "mistralai/mixtral-8x22b-instruct-v0.1",
                         "nvidia/llama-3.3-nemotron-super-49b-v1"
@@ -46,7 +47,7 @@ class NvidiaEscalateTool(Tool):
             "required": ["task"]
         }
 
-    def __init__(self, api_key: str = '', default_model: str = 'meta/llama-3.1-nemotron-ultra-253b-v1'):
+    def __init__(self, api_key: str = '', default_model: str = 'nvidia/llama-3.1-nemotron-ultra-253b-v1'):
         self.api_key = api_key or os.environ.get("NVIDIA_API_KEY", '')
         self.default_model = default_model
 
@@ -61,6 +62,10 @@ class NvidiaEscalateTool(Tool):
             )
 
         selected_model = model or self.default_model
+
+        # Strip XML tool call blocks that Qwen-style models may embed in task strings.
+        # Nemotron's vLLM endpoint processes <tool_call> tags during tokenization and will 500.
+        task = re.sub(r"<tool_call>.*?</tool_call>", "", task, flags=re.DOTALL).strip()
 
         headers = {
             "Authorization": f"Bearer {api_key}",

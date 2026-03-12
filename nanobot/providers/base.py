@@ -218,7 +218,7 @@ class LLMProvider(ABC):
                 attempt,
                 len(self._CHAT_RETRY_DELAYS),
                 delay,
-                err[:120],
+                err,
             )
             await asyncio.sleep(delay)
 
