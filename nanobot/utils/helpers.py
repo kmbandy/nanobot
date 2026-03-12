@@ -1,8 +1,10 @@
 """Utility functions for nanobot."""
 
+import json
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 
 def detect_image_mime(data: bytes) -> str | None:
@@ -66,6 +68,77 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
         chunks.append(content[:pos])
         content = content[pos:].lstrip()
     return chunks
+
+
+def build_assistant_message(
+    content: str | None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    reasoning_content: str | None = None,
+    thinking_blocks: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Build a provider-safe assistant message with optional reasoning fields."""
+    msg: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    if reasoning_content is not None:
+        msg["reasoning_content"] = reasoning_content
+    if thinking_blocks:
+        msg["thinking_blocks"] = thinking_blocks
+    return msg
+
+
+def estimate_message_tokens(message: dict) -> int:
+    """Estimate tokens for a single message dict."""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = " ".join(
+            part.get("text", "") for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    else:
+        text = ""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        return len(text) // 4
+
+
+def estimate_prompt_tokens(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
+    """Estimate prompt tokens using tiktoken cl100k_base."""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        parts: list[str] = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        txt = part.get("text", "")
+                        if txt:
+                            parts.append(txt)
+        if tools:
+            parts.append(json.dumps(tools, ensure_ascii=False))
+        return len(enc.encode("\n".join(parts)))
+    except Exception:
+        return 0
+
+
+def estimate_prompt_tokens_chain(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+) -> int:
+    """Sum token estimates across all messages."""
+    return sum(estimate_message_tokens(m) for m in messages)
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:

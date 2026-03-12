@@ -13,7 +13,7 @@ from loguru import logger
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.providers.base import LLMProvider
-from nanobot.utils.helpers import detect_image_mime
+from nanobot.utils.helpers import build_assistant_message, detect_image_mime
 
 
 class ContextBuilder:
@@ -37,18 +37,17 @@ class ContextBuilder:
         self._compacted_cache: str | None = None
         self._compacted_mtime: float | None = None
 
-    async def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+    def _build_system_prompt_core(self, memory_text: str | None = None, skill_names: list[str] | None = None) -> str:
+        """Build system prompt from identity, bootstrap, memory, and skills (sync, no compaction)."""
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
+        memory = memory_text if memory_text is not None else self.memory.get_memory_context()
         if memory:
-            compacted = await self._maybe_compact_memory(memory)
-            parts.append(f"# Memory\n\n{compacted}")
+            parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -66,6 +65,15 @@ Skills with available="false" need dependencies installed first - you can try in
 {skills_summary}""")
 
         return "\n\n---\n\n".join(parts)
+
+    async def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+        """Build the system prompt with optional memory compaction."""
+        raw_memory = self.memory.get_memory_context()
+        if raw_memory:
+            compacted = await self._maybe_compact_memory(raw_memory)
+        else:
+            compacted = None
+        return self._build_system_prompt_core(memory_text=compacted, skill_names=skill_names)
 
     async def _summarize_memory(self, content: str) -> str:
         """Summarize memory content using LLM. Returns concise bullet points."""
@@ -183,7 +191,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         return "\n\n".join(parts) if parts else ""
 
-    async def build_messages(
+    def build_messages(
         self,
         history: list[dict[str, Any]],
         current_message: str,
@@ -192,7 +200,31 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         channel: str | None = None,
         chat_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Build the complete message list for an LLM call."""
+        """Build the complete message list (sync, no memory compaction). For token estimation."""
+        runtime_ctx = self._build_runtime_context(channel, chat_id)
+        user_content = self._build_user_content(current_message, media)
+
+        if isinstance(user_content, str):
+            merged = f"{runtime_ctx}\n\n{user_content}"
+        else:
+            merged = [{"type": "text", "text": runtime_ctx}] + user_content
+
+        return [
+            {"role": "system", "content": self._build_system_prompt_core(skill_names=skill_names)},
+            *history,
+            {"role": "user", "content": merged},
+        ]
+
+    async def build_messages_full(
+        self,
+        history: list[dict[str, Any]],
+        current_message: str,
+        skill_names: list[str] | None = None,
+        media: list[str] | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build the complete message list with memory compaction for actual LLM calls."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
         user_content = self._build_user_content(current_message, media)
 
@@ -245,12 +277,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
         """Add an assistant message to the message list."""
-        msg: dict[str, Any] = {"role": "assistant", "content": content}
-        if tool_calls:
-            msg["tool_calls"] = tool_calls
-        if reasoning_content is not None:
-            msg["reasoning_content"] = reasoning_content
-        if thinking_blocks:
-            msg["thinking_blocks"] = thinking_blocks
-        messages.append(msg)
+        messages.append(build_assistant_message(
+            content,
+            tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
+            thinking_blocks=thinking_blocks,
+        ))
         return messages
