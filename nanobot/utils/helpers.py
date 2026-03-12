@@ -138,9 +138,10 @@ def estimate_prompt_tokens_chain(
     model: str,
     messages: list[dict],
     tools: list[dict] | None = None,
-) -> int:
-    """Estimate total prompt tokens across all messages."""
-    return sum(estimate_message_tokens(m) for m in messages)
+) -> tuple[int, str]:
+    """Estimate total prompt tokens across all messages. Returns (token_count, source)."""
+    count = sum(estimate_message_tokens(m) for m in messages)
+    return count, "tiktoken"
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
