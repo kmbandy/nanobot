@@ -134,10 +134,12 @@ def estimate_prompt_tokens(
 
 
 def estimate_prompt_tokens_chain(
+    provider: Any,
+    model: str,
     messages: list[dict],
     tools: list[dict] | None = None,
 ) -> int:
-    """Sum token estimates across all messages."""
+    """Estimate total prompt tokens across all messages."""
     return sum(estimate_message_tokens(m) for m in messages)
 
 
