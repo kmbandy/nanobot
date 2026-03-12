@@ -360,6 +360,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    extends: str | None = Field(default=None, exclude=True)
 
     @property
     def workspace_path(self) -> Path:

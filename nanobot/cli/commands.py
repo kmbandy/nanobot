@@ -168,27 +168,34 @@ def main(
 
 
 @app.command()
-def onboard():
+def onboard(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
     """Initialize nanobot configuration and workspace."""
-    from nanobot.config.loader import get_config_path, load_config, save_config
+    from nanobot.config.loader import get_config_path, load_config, save_config, set_config_path
     from nanobot.config.schema import Config
 
-    config_path = get_config_path()
+    config_override_path = None
+    if config:
+        config_override_path = Path(config).expanduser().resolve()
+        set_config_path(config_override_path)
+
+    config_path = config_override_path or get_config_path()
 
     if config_path.exists():
         console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
         console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
         console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
         if typer.confirm("Overwrite?"):
-            config = Config()
-            save_config(config)
+            config_obj = Config()
+            save_config(config_obj, config_path)
             console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
         else:
-            config = load_config()
-            save_config(config)
+            config_obj = load_config(config_path)
+            save_config(config_obj, config_path)
             console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
     else:
-        save_config(Config())
+        save_config(Config(), config_path)
         console.print(f"[green]✓[/green] Created config at {config_path}")
 
     # Create workspace
