@@ -61,6 +61,10 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        cf_crawl_config: Any | None = None,
+        memory_max_chars: int | None = None,
+        memory_max_tokens: int | None = None,
+        memory_compaction_enabled: bool | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -97,6 +101,13 @@ class AgentLoop:
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
+
+        # Use custom memory settings if provided (stored for potential future use)
+        self.memory_max_chars = memory_max_chars or 8000
+        self.memory_max_tokens = memory_max_tokens or 2000
+        self.memory_compaction_enabled = memory_compaction_enabled if memory_compaction_enabled is not None else True
+        self.cf_crawl_config = cf_crawl_config
+
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
@@ -106,7 +117,13 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
         )
+
         self._register_default_tools()
+
+        # Register CfCrawlTool if config provided
+        if cf_crawl_config:
+            from nanobot.agent.tools.cf_crawl import CfCrawlTool
+            self.tools.register(CfCrawlTool(config=cf_crawl_config))
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""

@@ -168,12 +168,26 @@ def main(
 
 
 @app.command()
-def onboard():
+def onboard(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
     """Initialize nanobot configuration and workspace."""
-    from nanobot.config.loader import get_config_path, load_config, save_config
+    from nanobot.config.loader import get_config_path, load_config, save_config, set_config_path
     from nanobot.config.schema import Config
 
-    config_path = get_config_path()
+    config_path = None
+    if config:
+        config_path = Path(config).expanduser().resolve()
+        if not config_path.exists():
+            console.print(f"[red]Error: Config file not found: {config_path}[/red]")
+            raise typer.Exit(1)
+        set_config_path(config_path)
+        console.print(f"[dim]Using config: {config_path}[/dim]")
+
+    if config_path:
+        config_path = config_path
+    else:
+        config_path = get_config_path()
 
     if config_path.exists():
         console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
@@ -184,7 +198,7 @@ def onboard():
             save_config(config)
             console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
         else:
-            config = load_config()
+            config = load_config(config_path)
             save_config(config)
             console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
     else:
@@ -215,9 +229,9 @@ def onboard():
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
+    from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
     from nanobot.providers.base import GenerationSettings
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-    from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
@@ -348,6 +362,10 @@ def gateway(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
+        cf_crawl_config=config.tools.cf_crawl,
+        memory_max_chars=config.agents.defaults.memory_max_chars,
+        memory_max_tokens=config.agents.defaults.memory_max_tokens,
+        memory_compaction_enabled=config.agents.defaults.memory_compaction_enabled,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
@@ -531,6 +549,10 @@ def agent(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
+        cf_crawl_config=config.tools.cf_crawl,
+        memory_max_chars=config.agents.defaults.memory_max_chars,
+        memory_max_tokens=config.agents.defaults.memory_max_tokens,
+        memory_compaction_enabled=config.agents.defaults.memory_compaction_enabled,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,

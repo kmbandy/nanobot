@@ -5,7 +5,6 @@ from pathlib import Path
 
 from nanobot.config.schema import Config
 
-
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
 
@@ -21,6 +20,17 @@ def get_config_path() -> Path:
     if _current_config_path:
         return _current_config_path
     return Path.home() / ".nanobot" / "config.json"
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base, with override values taking precedence."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -39,6 +49,20 @@ def load_config(config_path: Path | None = None) -> Config:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
+
+            extends_path = data.pop("extends", None)
+            if extends_path:
+                base_path = Path(extends_path).expanduser()
+                if not base_path.is_absolute():
+                    base_path = path.parent / base_path
+                try:
+                    with open(base_path, encoding="utf-8") as f:
+                        base_data = json.load(f)
+                    data = _deep_merge(base_data, data)
+                except (FileNotFoundError, json.JSONDecodeError) as e:
+                    print(f"Warning: Base config {base_path} not found or invalid: {e}")
+                    print("Proceeding with child config only.")
+
             data = _migrate_config(data)
             return Config.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:

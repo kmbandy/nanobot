@@ -243,6 +243,9 @@ class AgentDefaults(Base):
     # Deprecated compatibility field: accepted from old configs but ignored at runtime.
     memory_window: int | None = Field(default=None, exclude=True)
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    memory_max_chars: int = 8000
+    memory_max_tokens: int = 2000
+    memory_compaction_enabled: bool = True
 
     @property
     def should_warn_deprecated_memory_window(self) -> bool:
@@ -310,6 +313,14 @@ class WebSearchConfig(Base):
     max_results: int = 5
 
 
+class CfCrawlConfig(Base):
+    """Cloudflare Browser Rendering / Crawl API configuration."""
+
+    api_token: str = ""  # Cloudflare API token
+    account_id: str = ""  # Cloudflare account ID
+    base_url: str = "https://api.cloudflare.com/client/v4"
+
+
 class WebToolsConfig(Base):
     """Web tools configuration."""
 
@@ -343,6 +354,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    cf_crawl: CfCrawlConfig = Field(default_factory=CfCrawlConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
@@ -355,6 +367,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    extends: str | None = Field(default=None, exclude=True)
 
     @property
     def workspace_path(self) -> Path:
