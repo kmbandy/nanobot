@@ -27,6 +27,7 @@ def _short_tool_id() -> str:
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
+    
     Supports OpenRouter, Anthropic, OpenAI, Gemini, MiniMax, and many other providers through
     a unified interface.  Provider-specific logic is driven by the registry
     (see providers/registry.py) — no if-elif chains needed here.
@@ -261,11 +262,11 @@ class LiteLLMProvider(LLMProvider):
         # Pass extra headers (e.g. APP-Code for AiHubMix)
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
-
+        
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
             kwargs["drop_params"] = True
-
+        
         if tools and not self.suppress_tools_param:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
@@ -310,17 +311,10 @@ class LiteLLMProvider(LLMProvider):
             if isinstance(args, str):
                 args = json_repair.loads(args)
 
-            provider_specific_fields = getattr(tc, "provider_specific_fields", None) or None
-            function_provider_specific_fields = (
-                getattr(tc.function, "provider_specific_fields", None) or None
-            )
-
             tool_calls.append(ToolCallRequest(
                 id=_short_tool_id(),
                 name=tc.function.name,
                 arguments=args,
-                provider_specific_fields=provider_specific_fields,
-                function_provider_specific_fields=function_provider_specific_fields,
             ))
 
         # Fallback: some models (e.g. Qwen via Ollama/vLLM) embed tool-call JSON
@@ -335,10 +329,6 @@ class LiteLLMProvider(LLMProvider):
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
-
-        # Extract tool calls from text content (for Qwen models that output XML/JSON)
-        if tool_calls is None and content:
-            tool_calls, content = LiteLLMProvider._extract_text_tool_calls(content)
 
         reasoning_content = getattr(message, "reasoning_content", None) or None
         thinking_blocks = getattr(message, "thinking_blocks", None) or None
@@ -376,7 +366,7 @@ class LiteLLMProvider(LLMProvider):
                 name = fn_match.group(1)
                 body = fn_match.group(2)
                 arguments = {}
-                for param in re.finditer(r"<parameter=(\w+)>(.*?)</parameter>", body, re.DOTALL):
+                for param in re.finditer(r"<?parameter=(\w+)>(.*?)</parameter>", body, re.DOTALL):
                     arguments[param.group(1)] = param.group(2).strip()
                 if arguments:
                     calls.append(ToolCallRequest(id=_short_tool_id(), name=name, arguments=arguments))
@@ -408,9 +398,9 @@ class LiteLLMProvider(LLMProvider):
                     arguments=obj["arguments"],
                 ))
         if calls:
-            preamble = content[:json_start].strip() or None
-            logger.info("_parse_response: extracted {} JSON-embedded tool call(s): {}",
+            logger.info("_parse_response: extracted {} text-embedded tool call(s): {}",
                         len(calls), [c.name for c in calls])
+            preamble = content[:json_start].strip() or None
             return calls, preamble
         return [], content
 

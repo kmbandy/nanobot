@@ -12,7 +12,8 @@ from loguru import logger
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
-from nanobot.utils.helpers import build_assistant_message, detect_image_mime
+from nanobot.providers.base import LLMProvider
+from nanobot.utils.helpers import detect_image_mime
 
 
 class ContextBuilder:
@@ -244,10 +245,12 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
         """Add an assistant message to the message list."""
-        messages.append(build_assistant_message(
-            content,
-            tool_calls=tool_calls,
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        ))
+        msg: dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        if reasoning_content is not None:
+            msg["reasoning_content"] = reasoning_content
+        if thinking_blocks:
+            msg["thinking_blocks"] = thinking_blocks
+        messages.append(msg)
         return messages

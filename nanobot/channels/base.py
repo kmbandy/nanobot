@@ -1,9 +1,6 @@
 """Base channel interface for chat platforms."""
 
-from __future__ import annotations
-
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -21,8 +18,6 @@ class BaseChannel(ABC):
     """
 
     name: str = "base"
-    display_name: str = "Base"
-    transcription_api_key: str = ""
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -35,19 +30,6 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
-
-    async def transcribe_audio(self, file_path: str | Path) -> str:
-        """Transcribe an audio file via Groq Whisper. Returns empty string on failure."""
-        if not self.transcription_api_key:
-            return ""
-        try:
-            from nanobot.providers.transcription import GroqTranscriptionProvider
-
-            provider = GroqTranscriptionProvider(api_key=self.transcription_api_key)
-            return await provider.transcribe(file_path)
-        except Exception as e:
-            logger.warning("{}: audio transcription failed: {}", self.name, e)
-            return ""
 
     @abstractmethod
     async def start(self) -> None:

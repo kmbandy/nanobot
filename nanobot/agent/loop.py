@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.sysmon import SysmonTool
@@ -56,7 +57,10 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int = 40,
-        context_window_tokens: int = 65_536,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        memory_window: int = 100,
+        reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         searxng_url: str | None = None,
@@ -68,10 +72,10 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
-        cf_crawl_config: Any | None = None,
-        memory_max_chars: int | None = None,
-        memory_max_tokens: int | None = None,
-        memory_compaction_enabled: bool | None = None,
+        cf_crawl_config: CfCrawlConfig | None = None,
+        memory_max_chars: int = 8000,
+        memory_max_tokens: int = 2000,
+        memory_compaction_enabled: bool = True,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -80,7 +84,10 @@ class AgentLoop:
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
-        self.context_window_tokens = context_window_tokens
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.memory_window = memory_window
+        self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.searxng_url = searxng_url
@@ -109,6 +116,9 @@ class AgentLoop:
             workspace=workspace,
             bus=bus,
             model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            reasoning_effort=reasoning_effort,
             brave_api_key=brave_api_key,
             web_proxy=web_proxy,
             searxng_url=searxng_url,
@@ -121,31 +131,13 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._consolidating: set[str] = set()  # Session keys with consolidation in progress
+        self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
+        self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
-
-        # Use custom memory settings if provided (stored for potential future use)
-        self.memory_max_chars = memory_max_chars or 8000
-        self.memory_max_tokens = memory_max_tokens or 2000
-        self.memory_compaction_enabled = memory_compaction_enabled if memory_compaction_enabled is not None else True
         self.cf_crawl_config = cf_crawl_config
-
-        self.memory_consolidator = MemoryConsolidator(
-            workspace=workspace,
-            provider=provider,
-            model=self.model,
-            sessions=self.sessions,
-            context_window_tokens=context_window_tokens,
-            build_messages=self.context.build_messages,
-            get_tool_definitions=self.tools.get_definitions,
-        )
-
         self._register_default_tools()
-
-        # Register CfCrawlTool if config provided
-        if cf_crawl_config:
-            from nanobot.agent.tools.cf_crawl import CfCrawlTool
-            self.tools.register(CfCrawlTool(config=cf_crawl_config))
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -220,7 +212,7 @@ class AgentLoop:
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop."""
+        """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
         iteration = 0
         final_content = None
@@ -229,12 +221,13 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            tool_defs = self.tools.get_definitions()
-
             response = await self.provider.chat_with_retry(
                 messages=messages,
-                tools=tool_defs,
+                tools=self.tools.get_definitions(),
                 model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                reasoning_effort=self.reasoning_effort,
             )
 
             if response.has_tool_calls:
@@ -245,7 +238,14 @@ class AgentLoop:
                     await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
 
                 tool_call_dicts = [
-                    tc.to_openai_tool_call()
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments, ensure_ascii=False)
+                        }
+                    }
                     for tc in response.tool_calls
                 ]
                 suppress = getattr(self.provider, "suppress_tools_param", False)
@@ -378,17 +378,15 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history(max_messages=0)
-            messages = self.context.build_messages(
+            history = session.get_history(max_messages=self.memory_window)
+            messages = await self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
-            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -401,20 +399,27 @@ class AgentLoop:
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
+            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
+            self._consolidating.add(session.key)
             try:
-                if not await self.memory_consolidator.archive_unconsolidated(session):
-                    return OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content="Memory archival failed, session not cleared. Please try again.",
-                    )
+                async with lock:
+                    snapshot = session.messages[session.last_consolidated:]
+                    if snapshot:
+                        temp = Session(key=session.key)
+                        temp.messages = list(snapshot)
+                        if not await self._consolidate_memory(temp, archive_all=True):
+                            return OutboundMessage(
+                                channel=msg.channel, chat_id=msg.chat_id,
+                                content="Memory archival failed, session not cleared. Please try again.",
+                            )
             except Exception:
                 logger.exception("/new archival failed for {}", session.key)
                 return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                    channel=msg.channel, chat_id=msg.chat_id,
                     content="Memory archival failed, session not cleared. Please try again.",
                 )
+            finally:
+                self._consolidating.discard(session.key)
 
             session.clear()
             self.sessions.save(session)
@@ -425,15 +430,31 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        unconsolidated = len(session.messages) - session.last_consolidated
+        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
+            self._consolidating.add(session.key)
+            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
+
+            async def _consolidate_and_unlock():
+                try:
+                    async with lock:
+                        await self._consolidate_memory(session)
+                finally:
+                    self._consolidating.discard(session.key)
+                    _task = asyncio.current_task()
+                    if _task is not None:
+                        self._consolidation_tasks.discard(_task)
+
+            _task = asyncio.create_task(_consolidate_and_unlock())
+            self._consolidation_tasks.add(_task)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = session.get_history(max_messages=0)
-        initial_messages = self.context.build_messages(
+        history = session.get_history(max_messages=self.memory_window)
+        initial_messages = await self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
@@ -457,7 +478,6 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -503,6 +523,13 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
+        """Delegate to MemoryStore.consolidate(). Returns True on success."""
+        return await MemoryStore(self.workspace).consolidate(
+            session, self.provider, self.model,
+            archive_all=archive_all, memory_window=self.memory_window,
+        )
 
     async def process_direct(
         self,
