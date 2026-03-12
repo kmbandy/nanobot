@@ -194,15 +194,15 @@ def onboard(
         console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
         console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
         if typer.confirm("Overwrite?"):
-            config = Config()
-            save_config(config)
+            config_obj = Config()
+            save_config(config_obj, config_path)
             console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
         else:
             config = load_config(config_path)
             save_config(config)
             console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
     else:
-        save_config(Config())
+        save_config(Config(), config_path)
         console.print(f"[green]✓[/green] Created config at {config_path}")
 
     console.print("[dim]Config template now uses `maxTokens` + `contextWindowTokens`; `memoryWindow` is no longer a runtime setting.[/dim]")
@@ -368,12 +368,19 @@ def gateway(
         memory_compaction_enabled=config.agents.defaults.memory_compaction_enabled,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
+        searxng_url=config.tools.web.search.searxng_url or None,
         exec_config=config.tools.exec,
+        nvidia_api_key=config.tools.nvidia.api_key or None,
+        nvidia_default_model=config.tools.nvidia.default_model,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        cf_crawl_config=config.tools.cf_crawl,
+        memory_max_chars=config.agents.defaults.memory_max_chars,
+        memory_max_tokens=config.agents.defaults.memory_max_tokens,
+        memory_compaction_enabled=config.agents.defaults.memory_compaction_enabled,
     )
 
     # Set cron callback (needs agent)
@@ -555,11 +562,18 @@ def agent(
         memory_compaction_enabled=config.agents.defaults.memory_compaction_enabled,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
+        searxng_url=config.tools.web.search.searxng_url or None,
         exec_config=config.tools.exec,
+        nvidia_api_key=config.tools.nvidia.api_key or None,
+        nvidia_default_model=config.tools.nvidia.default_model,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        cf_crawl_config=config.tools.cf_crawl,
+        memory_max_chars=config.agents.defaults.memory_max_chars,
+        memory_max_tokens=config.agents.defaults.memory_max_tokens,
+        memory_compaction_enabled=config.agents.defaults.memory_compaction_enabled,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

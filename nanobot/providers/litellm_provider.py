@@ -323,6 +323,11 @@ class LiteLLMProvider(LLMProvider):
                 function_provider_specific_fields=function_provider_specific_fields,
             ))
 
+        # Fallback: some models (e.g. Qwen via Ollama/vLLM) embed tool-call JSON
+        # in the text content instead of the structured tool_calls field.
+        if not tool_calls and content:
+            tool_calls, content = self._extract_text_tool_calls(content)
+
         usage = {}
         if hasattr(response, "usage") and response.usage:
             usage = {

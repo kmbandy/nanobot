@@ -31,7 +31,7 @@ def test_bootstrap_files_are_backed_by_templates() -> None:
         assert (template_dir / filename).is_file(), f"missing bootstrap template: {filename}"
 
 
-def test_system_prompt_stays_stable_when_clock_changes(tmp_path, monkeypatch) -> None:
+async def test_system_prompt_stays_stable_when_clock_changes(tmp_path, monkeypatch) -> None:
     """System prompt should not change just because wall clock minute changes."""
     monkeypatch.setattr(datetime_module, "datetime", _FakeDatetime)
 
@@ -39,20 +39,20 @@ def test_system_prompt_stays_stable_when_clock_changes(tmp_path, monkeypatch) ->
     builder = ContextBuilder(workspace)
 
     _FakeDatetime.current = real_datetime(2026, 2, 24, 13, 59)
-    prompt1 = builder.build_system_prompt()
+    prompt1 = await builder.build_system_prompt()
 
     _FakeDatetime.current = real_datetime(2026, 2, 24, 14, 0)
-    prompt2 = builder.build_system_prompt()
+    prompt2 = await builder.build_system_prompt()
 
     assert prompt1 == prompt2
 
 
-def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
+async def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     """Runtime metadata should be merged with the user message."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    messages = builder.build_messages(
+    messages = await builder.build_messages(
         history=[],
         current_message="Return exactly: OK",
         channel="cli",

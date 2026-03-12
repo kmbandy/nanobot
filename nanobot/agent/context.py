@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, detect_image_mime
@@ -19,12 +21,22 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, provider: LLMProvider | None = None, model: str | None = None,
+                 memory_max_chars: int = 8000, memory_max_tokens: int = 2000, memory_compaction_enabled: bool = True,
+                 temperature: float = 0.1):
         self.workspace = workspace
+        self.provider = provider
+        self.model = model
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        self.memory_max_chars = memory_max_chars
+        self.memory_max_tokens = memory_max_tokens
+        self.memory_compaction_enabled = memory_compaction_enabled
+        self.temperature = temperature
+        self._compacted_cache: str | None = None
+        self._compacted_mtime: float | None = None
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    async def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
@@ -34,7 +46,8 @@ class ContextBuilder:
 
         memory = self.memory.get_memory_context()
         if memory:
-            parts.append(f"# Memory\n\n{memory}")
+            compacted = await self._maybe_compact_memory(memory)
+            parts.append(f"# Memory\n\n{compacted}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -52,6 +65,57 @@ Skills with available="false" need dependencies installed first - you can try in
 {skills_summary}""")
 
         return "\n\n---\n\n".join(parts)
+
+    async def _summarize_memory(self, content: str) -> str:
+        """Summarize memory content using LLM. Returns concise bullet points."""
+        if not self.provider or not self.model:
+            return content
+
+        prompt = """Summarize the following memory text into concise bullet points. Preserve all distinct facts and key details, but remove verbose phrasing. Use short, factual statements.
+
+<MEMORY>
+""" + content + """
+</MEMORY>
+
+Only output the summary bullets, nothing else."""
+
+        try:
+            response = await self.provider.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.1,
+                max_tokens=1000,
+            )
+            if response.content:
+                return response.content.strip()
+        except Exception as e:
+            logger.warning("Memory summarization failed: {}", e)
+        return content
+
+    async def _maybe_compact_memory(self, raw_memory: str) -> str:
+        """Check thresholds and summarize if needed. Falls back to raw on errors."""
+        if not self.memory_compaction_enabled:
+            return raw_memory
+
+        chars = len(raw_memory)
+        tokens = chars // 4
+
+        if chars < self.memory_max_chars and tokens < self.memory_max_tokens:
+            return raw_memory
+
+        try:
+            current_mtime = self.memory.memory_file.stat().st_mtime
+        except FileNotFoundError:
+            return raw_memory
+
+        if self._compacted_cache is not None and self._compacted_mtime == current_mtime:
+            return self._compacted_cache
+
+        logger.info("Memory exceeded thresholds (chars: {}, tokens: {}), summarizing...", chars, tokens)
+        summarized = await self._summarize_memory(raw_memory)
+        self._compacted_cache = summarized
+        self._compacted_mtime = current_mtime
+        return summarized
 
     def _get_identity(self) -> str:
         """Get the core identity section."""
@@ -118,7 +182,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         return "\n\n".join(parts) if parts else ""
 
-    def build_messages(
+    async def build_messages(
         self,
         history: list[dict[str, Any]],
         current_message: str,
@@ -131,15 +195,13 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         runtime_ctx = self._build_runtime_context(channel, chat_id)
         user_content = self._build_user_content(current_message, media)
 
-        # Merge runtime context and user content into a single user message
-        # to avoid consecutive same-role messages that some providers reject.
         if isinstance(user_content, str):
             merged = f"{runtime_ctx}\n\n{user_content}"
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": await self.build_system_prompt(skill_names)},
             *history,
             {"role": "user", "content": merged},
         ]

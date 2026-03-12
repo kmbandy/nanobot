@@ -15,12 +15,16 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.sysmon import SysmonTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.config.schema import CfCrawlConfig
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.nvidia_escalate import NvidiaEscalateTool
+from nanobot.agent.tools.cf_crawl import CfCrawlTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -55,7 +59,10 @@ class AgentLoop:
         context_window_tokens: int = 65_536,
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
+        searxng_url: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        nvidia_api_key: str | None = None,
+        nvidia_default_model: str | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -76,11 +83,25 @@ class AgentLoop:
         self.context_window_tokens = context_window_tokens
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
+        self.searxng_url = searxng_url
         self.exec_config = exec_config or ExecToolConfig()
+        self.nvidia_api_key = nvidia_api_key
+        self.nvidia_default_model = nvidia_default_model
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.memory_max_chars = memory_max_chars
+        self.memory_max_tokens = memory_max_tokens
+        self.memory_compaction_enabled = memory_compaction_enabled
 
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(
+            workspace=workspace,
+            provider=provider,
+            model=self.model,
+            memory_max_chars=memory_max_chars,
+            memory_max_tokens=memory_max_tokens,
+            memory_compaction_enabled=memory_compaction_enabled,
+            temperature=self.temperature,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -90,6 +111,7 @@ class AgentLoop:
             model=self.model,
             brave_api_key=brave_api_key,
             web_proxy=web_proxy,
+            searxng_url=searxng_url,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
@@ -136,10 +158,13 @@ class AgentLoop:
             restrict_to_workspace=self.restrict_to_workspace,
             path_append=self.exec_config.path_append,
         ))
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
+        self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy, searxng_url=self.searxng_url))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        self.tools.register(SysmonTool())
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(NvidiaEscalateTool(api_key=self.nvidia_api_key or '', default_model=self.nvidia_default_model or 'meta/llama-3.1-nemotron-ultra-253b-v1'))
+        self.tools.register(CfCrawlTool(config=self.cf_crawl_config))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
@@ -223,8 +248,11 @@ class AgentLoop:
                     tc.to_openai_tool_call()
                     for tc in response.tool_calls
                 ]
+                suppress = getattr(self.provider, "suppress_tools_param", False)
+                # Strip think blocks before storing — they balloon context across tool iterations
+                asst_content = self._strip_think(response.content) or ("..." if suppress else None)
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
+                    messages, asst_content, None if suppress else tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
@@ -234,9 +262,13 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
+                    if getattr(self.provider, "suppress_tools_param", False):
+                        # No tool role messages — feed result back as a user message
+                        messages.append({"role": "user", "content": f"[Tool result: {tool_call.name}] {result}"})
+                    else:
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, tool_call.name, result
+                        )
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can

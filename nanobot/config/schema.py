@@ -265,6 +265,7 @@ class ProviderConfig(Base):
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    suppress_tools_param: bool = False  # Don't send tools in API call; rely on text extraction
 
 
 class ProvidersConfig(Base):
@@ -311,6 +312,22 @@ class WebSearchConfig(Base):
 
     api_key: str = ""  # Brave Search API key
     max_results: int = 5
+    searxng_url: str = ""  # SearXNG instance URL, e.g. "http://localhost:8888"
+
+
+class NvidiaConfig(Base):
+    """NVIDIA API configuration for model escalation."""
+
+    api_key: str = ""
+    default_model: str = "meta/llama-3.1-nemotron-ultra-253b-v1"
+
+
+class CfCrawlConfig(Base):
+    """Cloudflare Browser Rendering / Crawl API configuration."""
+
+    api_token: str = ""  # Cloudflare API token
+    account_id: str = ""  # Cloudflare account ID
+    base_url: str = "https://api.cloudflare.com/client/v4"
 
 
 class CfCrawlConfig(Base):
