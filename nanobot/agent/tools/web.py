@@ -59,26 +59,39 @@ class WebSearchTool(Tool):
     }
 
     def __init__(self, api_key: str | None = None, max_results: int = 5, proxy: str | None = None,
-                 searxng_url: str | None = None):
+                 searxng_url: str | None = None, max_searches: int = 15):
         self._init_api_key = api_key
         self.max_results = max_results
         self.proxy = proxy
         self.searxng_url = searxng_url or os.environ.get("SEARXNG_URL", "")
+        self.max_searches = max_searches
+        self._search_count = 0
 
     @property
     def api_key(self) -> str:
         return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
+        self._search_count += 1
+        if self._search_count > self.max_searches:
+            return (
+                f"[SEARCH BUDGET EXHAUSTED] You have used all {self.max_searches} web searches "
+                "allowed for this task. Stop searching and complete the task using what you have already found."
+            )
+        remaining = self.max_searches - self._search_count
         n = min(max(count or self.max_results, 1), 10)
         if self.searxng_url:
-            return await self._searxng(query, n)
-        if self.api_key:
-            return await self._brave(query, n)
-        return (
-            "Error: No search backend configured. Set tools.web.search.searxngUrl in "
-            "~/.nanobot/config.json (e.g. 'http://localhost:8888') or provide a Brave API key."
-        )
+            result = await self._searxng(query, n)
+        elif self.api_key:
+            result = await self._brave(query, n)
+        else:
+            return (
+                "Error: No search backend configured. Set tools.web.search.searxngUrl in "
+                "~/.nanobot/config.json (e.g. 'http://localhost:8888') or provide a Brave API key."
+            )
+        if remaining <= 3:
+            result += f"\n\n[Search budget: {remaining} search(es) remaining — wrap up soon.]"
+        return result
 
     async def _searxng(self, query: str, n: int) -> str:
         try:
