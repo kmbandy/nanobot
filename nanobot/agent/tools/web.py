@@ -66,12 +66,20 @@ class WebSearchTool(Tool):
         self.searxng_url = searxng_url or os.environ.get("SEARXNG_URL", "")
         self.max_searches = max_searches
         self._search_count = 0
+        self._seen_queries: set[str] = set()
 
     @property
     def api_key(self) -> str:
         return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
+        normalized = query.strip().lower()
+        if normalized in self._seen_queries:
+            return (
+                f"[DUPLICATE SEARCH] You already searched for \"{query}\". "
+                "Try a different query or stop searching and summarize what you have found."
+            )
+        self._seen_queries.add(normalized)
         self._search_count += 1
         if self._search_count > self.max_searches:
             return (
