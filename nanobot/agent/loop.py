@@ -71,6 +71,7 @@ class AgentLoop:
         memory_max_chars: int | None = None,
         memory_max_tokens: int | None = None,
         memory_compaction_enabled: bool | None = None,
+        sysmon: bool = True,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -88,6 +89,7 @@ class AgentLoop:
         self.nvidia_default_model = nvidia_default_model
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.sysmon = sysmon
 
         self.context = ContextBuilder(
             workspace=workspace,
@@ -154,7 +156,8 @@ class AgentLoop:
         ))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy, searxng_url=self.searxng_url))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
-        self.tools.register(SysmonTool())
+        if self.sysmon:
+            self.tools.register(SysmonTool())
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(NvidiaEscalateTool(
@@ -391,7 +394,7 @@ class AgentLoop:
 
         # Slash commands
         cmd = msg.content.strip().lower()
-        if cmd == "/new":
+        if cmd in ("/new", "/reset", "!reset"):
             try:
                 if not await self.memory_consolidator.archive_unconsolidated(session):
                     return OutboundMessage(
@@ -414,7 +417,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history and start fresh\n/stop — Stop the current task\n/help — Show available commands")
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
