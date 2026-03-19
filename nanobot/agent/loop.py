@@ -33,6 +33,82 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig
     from nanobot.cron.service import CronService
 
+# ── Discord fleet commands (!status, !tasks) ───────────────────────────────────
+
+async def _cmd_status() -> str:
+    """Collect and format fleet status for Discord."""
+    import sys
+    collector = Path.home() / "mad-lab-scripts" / "data_collector.py"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(collector),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        data = json.loads(stdout)
+    except Exception as e:
+        return f"❌ Status unavailable: {e}"
+
+    lines = ["🤖 **mad-lab fleet status**"]
+
+    gpus = data.get("gpu", [])
+    if gpus:
+        gpu_parts = []
+        for g in gpus:
+            gpu_parts.append(
+                f"{g['name']}: {g['utilization']}% | {g['vram_used']}/{g['vram_total']}MB | {g['temperature']}°C"
+            )
+        lines.append("**GPU** — " + " | ".join(gpu_parts))
+
+    sys_ = data.get("system", {})
+    lines.append(
+        f"**System** — CPU: {sys_.get('cpu_usage', 0):.1f}% | "
+        f"RAM: {sys_.get('ram_used', 0) // 1024:.1f}/{sys_.get('ram_total', 0) // 1024:.0f}GB | "
+        f"Up: {sys_.get('uptime_human', '?')}"
+    )
+
+    agents = data.get("agents", [])
+    if agents:
+        agent_parts = []
+        for a in agents:
+            icon = "✅" if a["status"] == "running" else "⏸"
+            agent_parts.append(f"{icon} {a['name']}")
+        lines.append("**Agents** — " + " | ".join(agent_parts))
+
+    return "\n".join(lines)
+
+
+async def _cmd_tasks() -> str:
+    """Query ChromaDB for pending tasks and format for Discord."""
+    try:
+        import chromadb
+        from pathlib import Path as _Path
+        db_path = str(_Path.home() / ".mad-lab-mcp" / "chromadb")
+        client = chromadb.PersistentClient(path=db_path)
+        col = client.get_collection("memory")
+        results = col.get(
+            where={"$and": [{"type": "task"}, {"status": "pending"}]},
+            include=["metadatas", "documents"],
+        )
+    except Exception as e:
+        return f"❌ Tasks unavailable: {e}"
+
+    ids = results.get("ids", [])
+    if not ids:
+        return "📋 **Pending tasks** — none"
+
+    lines = [f"📋 **Pending tasks** ({len(ids)})"]
+    for task_id, meta, doc in zip(ids, results["metadatas"], results["documents"]):
+        assignee = meta.get("assignee", "unassigned")
+        priority = meta.get("priority", "normal")
+        complexity = meta.get("complexity", "?")
+        short_id = task_id[:8]
+        desc = (doc[:60] + "…") if len(doc) > 60 else doc
+        lines.append(f"`{short_id}` [{complexity}/{priority}] → {assignee}: {desc}")
+
+    return "\n".join(lines)
+
 
 class AgentLoop:
     """
@@ -417,7 +493,19 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history and start fresh\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history and start fresh\n/stop — Stop the current task\n/help — Show available commands\n!status — Fleet hardware + agent status\n!tasks — Pending tasks in the pipeline")
+
+        if cmd == "!status":
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=await _cmd_status(),
+            )
+
+        if cmd == "!tasks":
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=await _cmd_tasks(),
+            )
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
