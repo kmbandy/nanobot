@@ -2,6 +2,7 @@
 
 import json
 import shutil
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -113,6 +114,24 @@ class SessionManager:
         self._cache[key] = session
         return session
 
+    @staticmethod
+    def _is_loop_state(messages: list[dict], window: int = 20, threshold: int = 3) -> bool:
+        """Return True if the tail of messages shows a repeated tool call loop."""
+        recent = messages[-window:]
+        sigs: list[str] = []
+        for m in recent:
+            if m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls", []):
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                args_preview = fn.get("arguments", "")[:80]
+                sigs.append(f"{name}|{args_preview}")
+        if not sigs:
+            return False
+        _, top_count = Counter(sigs).most_common(1)[0]
+        return top_count >= threshold
+
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
@@ -148,6 +167,17 @@ class SessionManager:
                         last_consolidated = data.get("last_consolidated", 0)
                     else:
                         messages.append(data)
+
+            # Detect loop state: if the last 20 messages show the same tool
+            # call repeated 3+ times, clear the session rather than resuming
+            # into a loop on restart.
+            if self._is_loop_state(messages):
+                logger.warning(
+                    "Session {} appears to be in a loop state — clearing to prevent loop resume",
+                    key,
+                )
+                messages = []
+                last_consolidated = 0
 
             return Session(
                 key=key,
