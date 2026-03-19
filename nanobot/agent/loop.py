@@ -1512,12 +1512,15 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
-        # Slash commands — strip leading @mention if present (e.g. "@bot-name !cmd")
+        # Slash commands — strip leading @mention if present
+        # Discord sends "<@USER_ID> !cmd" or "<@!USER_ID> !cmd"; CLI sends "@name !cmd"
         _content_stripped = msg.content.strip()
+        _content_stripped = re.sub(r'^<@!?\d+>\s*', '', _content_stripped)  # Discord mention
         if _content_stripped.startswith("@"):
-            # Drop the @mention token, leave the rest
+            # Plain @name mention (CLI / other channels)
             _parts = _content_stripped.split(None, 1)
             _content_stripped = _parts[1].strip() if len(_parts) > 1 else ""
+        if _content_stripped != msg.content.strip():
             msg.content = _content_stripped  # strip mention from LLM path too
         cmd = _content_stripped.lower()
         if cmd in ("/new", "/reset", "!reset"):
