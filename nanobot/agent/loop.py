@@ -579,6 +579,189 @@ WantedBy=default.target
 """
 
 
+async def _cmd_united() -> str:
+    """!united-latest — Man United latest result, next fixture, standings, talking points."""
+    import httpx
+    from datetime import datetime, timezone, timedelta
+
+    try:
+        from zoneinfo import ZoneInfo
+        _ET: Any = ZoneInfo("America/New_York")
+    except Exception:
+        _ET = timezone(timedelta(hours=-5))
+
+    MAN_UTD_ID = "360"
+    UA = {"User-Agent": "Mozilla/5.0"}
+    now = datetime.now(timezone.utc)
+
+    # Build 5 weekly date ranges starting from today for fixture scan
+    week_ranges = [
+        (
+            (now + timedelta(days=i * 7)).strftime("%Y%m%d"),
+            (now + timedelta(days=i * 7 + 6)).strftime("%Y%m%d"),
+        )
+        for i in range(5)
+    ]
+
+    async with httpx.AsyncClient(timeout=12, headers=UA) as client:
+        reqs = [
+            client.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/teams/{MAN_UTD_ID}/schedule"),
+            client.get("https://site.api.espn.com/apis/v2/sports/soccer/eng.1/standings"),
+            client.get("https://www.reddit.com/r/manchesterunited/hot.json?limit=15&raw_json=1"),
+        ] + [
+            client.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={s}-{e}&limit=100")
+            for s, e in week_ranges
+        ]
+        responses = await asyncio.gather(*reqs, return_exceptions=True)
+
+    sched_r, stand_r, reddit_r = responses[0], responses[1], responses[2]
+    sb_resps = responses[3:]
+
+    # ── Last result ────────────────────────────────────────────────────────────
+    last: dict | None = None
+    try:
+        events = sched_r.json().get("events", [])  # type: ignore[union-attr]
+        past: list[dict] = []
+        for ev in events:
+            comp = ev["competitions"][0]
+            status = comp["status"]["type"]["name"]
+            dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+            comps = comp["competitors"]
+            mu = next((c for c in comps if c["team"]["id"] == MAN_UTD_ID), None)
+            opp = next((c for c in comps if c["team"]["id"] != MAN_UTD_ID), None)
+            if not mu or not opp:
+                continue
+            mu_s = mu.get("score", {})
+            opp_s = opp.get("score", {})
+            mg = mu_s.get("displayValue", "?") if isinstance(mu_s, dict) else "?"
+            og = opp_s.get("displayValue", "?") if isinstance(opp_s, dict) else "?"
+            won = mu_s.get("winner", False) if isinstance(mu_s, dict) else False
+            venue = "H" if mu.get("homeAway") == "home" else "A"
+            if "FULL_TIME" in status or ("SCHEDULED" not in status and dt < now):
+                past.append({"dt": dt, "opp": opp["team"]["displayName"],
+                              "venue": venue, "mg": mg, "og": og, "won": won})
+        if past:
+            past.sort(key=lambda x: x["dt"])
+            last = past[-1]
+    except Exception:
+        pass
+
+    # ── Next fixture ───────────────────────────────────────────────────────────
+    next_fix: dict | None = None
+    try:
+        upcoming: list[dict] = []
+        for r in sb_resps:
+            if isinstance(r, Exception):
+                continue
+            for ev in r.json().get("events", []):  # type: ignore[union-attr]
+                comp = ev["competitions"][0]
+                status = comp["status"]["type"]["name"]
+                if "FULL_TIME" in status:
+                    continue
+                comps = comp["competitors"]
+                mu = next((c for c in comps if c.get("team", {}).get("id") == MAN_UTD_ID), None)
+                opp = next((c for c in comps if c.get("team", {}).get("id") != MAN_UTD_ID), None)
+                if not mu or not opp:
+                    continue
+                dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+                venue = "H" if mu.get("homeAway") == "home" else "A"
+                upcoming.append({"dt": dt, "opp": opp["team"]["displayName"],
+                                  "venue": venue, "name": ev.get("name", "")})
+        if upcoming:
+            upcoming.sort(key=lambda x: x["dt"])
+            next_fix = upcoming[0]
+    except Exception:
+        pass
+
+    # ── Standings ──────────────────────────────────────────────────────────────
+    table: list[dict] = []
+    mu_idx = -1
+    try:
+        entries = stand_r.json()["children"][0]["standings"]["entries"]  # type: ignore[union-attr]
+        for e in entries:
+            stats = {s["name"]: s for s in e["stats"]}
+            rank = int(stats.get("rank", {}).get("value", 99))
+            pts = int(stats.get("points", {}).get("value", 0))
+            gd_val = stats.get("pointDifferential", {})
+            gd = gd_val.get("displayValue", "0") if isinstance(gd_val, dict) else "0"
+            team = e["team"]["displayName"]
+            table.append({"rank": rank, "team": team, "pts": pts, "gd": gd})
+        table.sort(key=lambda x: x["rank"])
+        mu_idx = next((i for i, t in enumerate(table) if "Manchester United" in t["team"]), -1)
+    except Exception:
+        pass
+
+    # ── Reddit talking points ─────────────────────────────────────────────────
+    talking: list[str] = []
+    try:
+        posts = reddit_r.json()["data"]["posts"]  # type: ignore[union-attr]
+    except Exception:
+        posts = []
+    try:
+        if not posts:
+            posts = reddit_r.json()["data"]["children"]  # type: ignore[union-attr]
+    except Exception:
+        posts = []
+    for post in posts:
+        pd = post.get("data", post)
+        title = pd.get("title", "")
+        if not title or pd.get("stickied"):
+            continue
+        talking.append(title)
+        if len(talking) >= 3:
+            break
+
+    # ── Format output ──────────────────────────────────────────────────────────
+    def _fmt_dt_et(dt: datetime) -> str:
+        try:
+            local = dt.astimezone(_ET)
+            return local.strftime("%a %b %-d, %-I:%M %p ET")
+        except Exception:
+            return dt.strftime("%a %b %d %H:%MZ")
+
+    lines = ["🔴 **Manchester United**"]
+
+    # Last result
+    if last:
+        score = f"{last['mg']}–{last['og']}" if last["venue"] == "H" else f"{last['og']}–{last['mg']}"
+        result_icon = "✅" if last["won"] else ("➖" if last["mg"] == last["og"] else "❌")
+        venue_str = "vs" if last["venue"] == "H" else "@"
+        date_str = _fmt_dt_et(last["dt"])
+        lines.append(f"\n**Last Result:** {venue_str} {last['opp']} {score} {result_icon} _{date_str}_")
+    else:
+        lines.append("\n**Last Result:** unavailable")
+
+    # Next fixture
+    if next_fix:
+        venue_str = "vs" if next_fix["venue"] == "H" else "@"
+        lines.append(f"**Next Match:** {venue_str} {next_fix['opp']} — {_fmt_dt_et(next_fix['dt'])}")
+    else:
+        lines.append("**Next Match:** not found (check fixtures)")
+
+    # Standings
+    if table and mu_idx >= 0:
+        lines.append("\n**Premier League Table:**")
+        lines.append("```")
+        start = max(0, mu_idx - 2)
+        end = min(len(table), mu_idx + 3)
+        for i in range(start, end):
+            t = table[i]
+            arrow = " ←" if i == mu_idx else ""
+            lines.append(f"  {t['rank']:2d}. {t['team']:<24} {t['pts']:3d} pts  GD {t['gd']:>4}{arrow}")
+        lines.append("```")
+
+    # Talking points
+    if talking:
+        lines.append("**💬 r/ManchesterUnited:**")
+        for i, tp in enumerate(talking, 1):
+            lines.append(f"{i}. {tp[:110]}")
+
+    msg = "\n".join(lines)
+    if len(msg) > 1990:
+        msg = msg[:1987] + "…"
+    return msg
+
+
 def _wizard_load() -> dict | None:
     try:
         if _WIZARD_PATH.exists():
@@ -1321,7 +1504,7 @@ class AgentLoop:
 
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!new-nanobot — Interactive wizard to create a new bot config + service files\n!summarize <url> — Fetch and summarize any webpage\n!gh <owner/repo> — GitHub repo info + latest release\n!diff — Show nanobot changes since upstream sync\n!mad-code-summary <path> — Summarize a file's purpose\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!new-nanobot — Interactive wizard to create a new bot config + service files\n!united-latest — Man Utd last result, next fixture, PL table, r/ManUtd talking points\n!summarize <url> — Fetch and summarize any webpage\n!gh <owner/repo> — GitHub repo info + latest release\n!diff — Show nanobot changes since upstream sync\n!mad-code-summary <path> — Summarize a file's purpose\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
 
         if cmd == "!status":
             return OutboundMessage(
@@ -1366,6 +1549,12 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=await _cmd_mem(msg.content),
+            )
+
+        if cmd == "!united-latest":
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=await _cmd_united(),
             )
 
         if cmd == "!diff":
