@@ -79,6 +79,34 @@ async def _cmd_status() -> str:
     return "\n".join(lines)
 
 
+def _build_reddit_prompt(raw: str) -> str:
+    """Parse '!reddit <subreddit> <subject...>' and return a scoped LLM prompt."""
+    # Strip the command prefix — handle both plain and mention-prefixed variants
+    # e.g. "!reddit localllama best coding model" or "@bot !reddit localllama ..."
+    text = raw.strip()
+    # Find the !reddit token and take everything after it
+    idx = text.lower().find("!reddit ")
+    after = text[idx + len("!reddit "):].strip() if idx != -1 else text
+
+    parts = after.split(None, 1)
+    if len(parts) < 2:
+        subreddit = parts[0].lstrip("r/") if parts else "unknown"
+        subject = "recent top posts"
+    else:
+        subreddit = parts[0].lstrip("r/")
+        subject = parts[1]
+
+    return (
+        f'Search r/{subreddit} for posts related to "{subject}". '
+        f"Find the 5 most relevant or popular posts. "
+        f"For each one write a 2-3 sentence summary. "
+        f"Rules: use web_search with site:reddit.com/r/{subreddit} — "
+        f"do at most 3 searches, do not follow external links, "
+        f"do not write to memory. "
+        f"Once you have 5 summaries, stop immediately and present them."
+    )
+
+
 async def _cmd_brief() -> str:
     """Run morning-brief --stdout and return the brief text."""
     import sys
@@ -535,6 +563,9 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=await _cmd_brief(),
             )
+
+        if cmd.startswith("!reddit "):
+            msg.content = _build_reddit_prompt(msg.content)
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
