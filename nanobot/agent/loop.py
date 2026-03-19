@@ -107,6 +107,22 @@ def _build_reddit_prompt(raw: str) -> str:
     )
 
 
+def _build_python_prompt(raw: str) -> str:
+    """Parse '!python <description>' and return a focused code generation prompt."""
+    idx = raw.lower().find("!python ")
+    description = raw[idx + len("!python "):].strip() if idx != -1 else raw.strip()
+    return (
+        f"Write a Python script or function for the following: {description}\n\n"
+        f"Requirements:\n"
+        f"- Include a brief docstring explaining what it does\n"
+        f"- Add minimal inline comments only where the logic isn't obvious\n"
+        f"- Make it runnable as-is (include example usage or a __main__ block if appropriate)\n"
+        f"- Use only the standard library unless a third-party package is clearly necessary\n"
+        f"- Keep it concise — no unnecessary boilerplate\n"
+        f"Do not write to memory. Just output the code."
+    )
+
+
 def _build_search_prompt(raw: str) -> str:
     """Parse '!search <query>' and return a guardrailed web search prompt."""
     idx = raw.lower().find("!search ")
@@ -620,7 +636,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function")
 
         if cmd == "!status":
             return OutboundMessage(
@@ -654,6 +670,9 @@ class AgentLoop:
 
         elif cmd.startswith("!arxiv "):
             msg.content = _build_arxiv_prompt(msg.content)
+
+        elif cmd.startswith("!python "):
+            msg.content = _build_python_prompt(msg.content)
 
         elif cmd.startswith("!restart "):
             return OutboundMessage(
