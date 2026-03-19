@@ -345,6 +345,56 @@ def _cmd_restart(raw: str) -> str:
     return f"♻️ `{friendly}` restarted{session_note}."
 
 
+def _cmd_models() -> str:
+    """List available .gguf models in ~/models/."""
+    import subprocess
+    swap_bin = Path.home() / "mad-lab-mcp" / "bin" / "mad-hot-swap"
+    try:
+        r = subprocess.run(
+            ["python3", str(swap_bin), "--list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = r.stdout.strip()
+        return f"```\n{out}\n```" if out else "No models found in ~/models/"
+    except Exception as e:
+        return f"❌ Failed to list models: {e}"
+
+
+def _cmd_hotswap(raw: str) -> str:
+    """Handle '!mad-hot-swap <bot> <model>' — swap model on a bot."""
+    import subprocess, os
+    from pathlib import Path as _Path
+
+    idx = raw.lower().find("!mad-hot-swap ")
+    after = raw[idx + len("!mad-hot-swap "):].strip() if idx != -1 else ""
+    parts = after.split(None, 1)
+    if len(parts) < 2:
+        return "Usage: `!mad-hot-swap <bot> <model>`\nExample: `!mad-hot-swap eng-1 qwen3.5-9b`\nUse `!models` to list available models."
+
+    bot, model_query = parts[0].lower(), parts[1]
+
+    if bot not in ("eng-1", "eng-2"):
+        return f"❌ Unknown bot `{bot}`. Valid: eng-1, eng-2"
+
+    # Fix D-Bus so systemctl --user works inside subprocess
+    env = os.environ.copy()
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        candidate = f"/run/user/{os.getuid()}/bus"
+        if _Path(candidate).exists():
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={candidate}"
+
+    swap_bin = _Path.home() / "mad-lab-mcp" / "bin" / "mad-hot-swap"
+    try:
+        r = subprocess.run(
+            ["python3", str(swap_bin), bot, model_query],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        out = (r.stdout + r.stderr).strip()
+        return out if out else ("✅ Swap complete." if r.returncode == 0 else "❌ Swap failed (no output).")
+    except Exception as e:
+        return f"❌ Hot-swap failed: {e}"
+
+
 async def _cmd_brief() -> str:
     """Run morning-brief --stdout and return the brief text."""
     import sys
@@ -776,7 +826,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
 
         if cmd == "!status":
             return OutboundMessage(
@@ -821,6 +871,18 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=await _cmd_mem(msg.content),
+            )
+
+        if cmd == "!models":
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=_cmd_models(),
+            )
+
+        if cmd.startswith("!mad-hot-swap "):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=_cmd_hotswap(msg.content),
             )
 
         if cmd.startswith("!remind "):
