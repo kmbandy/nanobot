@@ -317,6 +317,65 @@ def _build_summarize_prompt(raw: str) -> str | None:
     return f"Please summarize the following web content from {url}:\n\n{text[:8000]}"
 
 
+async def _cmd_wikipedia(raw: str) -> str:
+    """Fetch a Wikipedia summary for a subject."""
+    import httpx
+
+    idx = raw.lower().find("!wikipedia ")
+    subject = raw[idx + len("!wikipedia "):].strip() if idx != -1 else raw.strip()
+    if not subject:
+        return "Usage: `!wikipedia <subject>`"
+
+    # Wikipedia REST API — returns clean summary JSON, no parsing needed
+    title = subject.strip().replace(" ", "_")
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": "mad-lab-bot/1.0"})
+            if resp.status_code == 404:
+                # Try search API to find closest match
+                search_resp = await client.get(
+                    "https://en.wikipedia.org/w/api.php",
+                    params={
+                        "action": "query",
+                        "list": "search",
+                        "srsearch": subject,
+                        "format": "json",
+                        "srlimit": 1,
+                    },
+                    headers={"User-Agent": "mad-lab-bot/1.0"},
+                )
+                results = search_resp.json().get("query", {}).get("search", [])
+                if not results:
+                    return f"❌ No Wikipedia article found for **{subject}**."
+                title = results[0]["title"].replace(" ", "_")
+                resp = await client.get(
+                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}",
+                    headers={"User-Agent": "mad-lab-bot/1.0"},
+                )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        return f"❌ Wikipedia fetch failed: {e}"
+
+    page_title   = data.get("title", subject)
+    extract      = data.get("extract", "")
+    wiki_url     = data.get("content_urls", {}).get("desktop", {}).get("page", "")
+    description  = data.get("description", "")
+
+    lines = [f"📖 **{page_title}**"]
+    if description:
+        lines.append(f"_{description}_")
+    lines.append("")
+    if extract:
+        # Cap at ~1200 chars so it fits cleanly in Discord
+        lines.append(extract[:1200] + ("…" if len(extract) > 1200 else ""))
+    if wiki_url:
+        lines.append(f"\n<{wiki_url}>")
+
+    return "\n".join(lines)
+
+
 async def _cmd_gh(raw: str) -> str:
     """Fetch GitHub repo info and latest release."""
     import httpx
@@ -1505,7 +1564,7 @@ class AgentLoop:
 
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!new-nanobot — Interactive wizard to create a new bot config + service files\n!united-latest — Man Utd last result, next fixture, PL table, r/ManUtd talking points\n!summarize <url> — Fetch and summarize any webpage\n!gh <owner/repo> — GitHub repo info + latest release\n!diff — Show nanobot changes since upstream sync\n!mad-code-summary <path> — Summarize a file's purpose\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!new-nanobot — Interactive wizard to create a new bot config + service files\n!united-latest — Man Utd last result, next fixture, PL table, r/ManUtd talking points\n!summarize <url> — Fetch and summarize any webpage\n!gh <owner/repo> — GitHub repo info + latest release\n!diff — Show nanobot changes since upstream sync\n!mad-code-summary <path> — Summarize a file's purpose\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!wikipedia <subject> — Wikipedia summary for any subject\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
 
         if cmd == "!status":
             return OutboundMessage(
@@ -1550,6 +1609,12 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=await _cmd_mem(msg.content),
+            )
+
+        if cmd.startswith("!wikipedia "):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=await _cmd_wikipedia(msg.content),
             )
 
         if cmd == "!united-latest":
