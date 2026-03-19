@@ -489,6 +489,330 @@ def _cmd_restart(raw: str) -> str:
     return f"♻️ `{friendly}` restarted{session_note}."
 
 
+# ── !new-nanobot wizard ────────────────────────────────────────────────────────
+
+_WIZARD_PATH = Path.home() / "mad-lab-mcp" / "shared" / "new-nanobot-wizard.json"
+
+_WIZARD_LLAMA_CUDA = """\
+[Unit]
+Description=llama-server: {model_name} CUDA (mad-lab-{bot_name})
+After=network.target
+
+[Service]
+ExecStart=/home/kmbandy/llama.cpp/build/bin/llama-server \\
+    --model {model_path} \\
+    --n-gpu-layers 999 \\
+    --ctx-size 32768 \\
+    --cache-type-k q4_0 \\
+    --cache-type-v q4_0 \\
+    --parallel 1 \\
+    --host 127.0.0.1 \\
+    --port {llama_port}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+_WIZARD_LLAMA_ROCM = """\
+[Unit]
+Description=llama-server: {model_name} ROCm RX480 (mad-lab-{bot_name})
+After=network.target
+
+[Service]
+Environment=HIP_VISIBLE_DEVICES=0
+Environment=ROCBLAS_TENSILE_LIBPATH=/tmp/fake-tensile
+ExecStartPre=/bin/bash -c "mkdir -p /tmp/fake-tensile && cp /opt/rocm-6.2.4/lib/rocblas/library/TensileLibrary_lazy_gfx900.dat /tmp/fake-tensile/TensileLibrary_lazy_gfx803.dat"
+ExecStart=/home/kmbandy/llama.cpp/build-rocm/bin/llama-server \\
+    --model {model_path} \\
+    --n-gpu-layers 999 \\
+    --ctx-size 24576 \\
+    --cache-type-k q8_0 \\
+    --cache-type-v q8_0 \\
+    --parallel 1 \\
+    --host 127.0.0.1 \\
+    --port {llama_port} \\
+    --no-warmup
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+_WIZARD_LLAMA_CPU = """\
+[Unit]
+Description=llama-server: {model_name} CPU (mad-lab-{bot_name})
+After=network.target
+
+[Service]
+Environment=CUDA_VISIBLE_DEVICES=
+ExecStart=/home/kmbandy/llama.cpp/build/bin/llama-server \\
+    --model {model_path} \\
+    --n-gpu-layers 0 \\
+    --ctx-size 16384 \\
+    --parallel 1 \\
+    --host 127.0.0.1 \\
+    --port {llama_port}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+_WIZARD_NANOBOT_SVC = """\
+[Unit]
+Description=mad-lab-{bot_name} Discord agent
+After=network.target llama-server-{bot_name}.service
+Requires=llama-server-{bot_name}.service
+
+[Service]
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/python3 /home/kmbandy/.local/bin/nanobot gateway --config /home/kmbandy/.nanobot-{bot_name}/config.json
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _wizard_load() -> dict | None:
+    try:
+        if _WIZARD_PATH.exists():
+            return json.loads(_WIZARD_PATH.read_text())
+    except Exception:
+        pass
+    return None
+
+
+def _wizard_save(state: dict) -> None:
+    _WIZARD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _WIZARD_PATH.write_text(json.dumps(state, indent=2))
+
+
+def _wizard_clear() -> None:
+    try:
+        _WIZARD_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _wizard_find_model(query: str) -> Path | None:
+    """Reuse mad-hot-swap fuzzy model matching."""
+    import re as _re
+    models_dir = Path.home() / "models"
+    candidates = sorted(models_dir.glob("*.gguf"), key=lambda p: p.name.lower())
+    query_lower = query.lower()
+    for m in candidates:
+        if m.name.lower() == query_lower:
+            return m
+    tokens = _re.split(r'[\s\-_\.]+', query_lower)
+    scored = [m for m in candidates if all(t in m.name.lower() for t in tokens if t)]
+    if len(scored) == 1:
+        return scored[0]
+    if len(scored) > 1:
+        return min(scored, key=lambda p: len(p.name))
+    return None
+
+
+def _wizard_list_models() -> str:
+    models_dir = Path.home() / "models"
+    models = sorted(models_dir.glob("*.gguf"), key=lambda p: p.name.lower())
+    if not models:
+        return "No models found in ~/models/"
+    lines = ["Available models:"]
+    for m in models:
+        size_mb = m.stat().st_size // (1024 * 1024)
+        lines.append(f"  `{m.stem}` ({size_mb} MB)")
+    return "\n".join(lines)
+
+
+def _wizard_generate(state: dict) -> str:
+    """Generate all config/service files for the new bot. Returns summary message."""
+    bot_name: str = state["name"]
+    model_path: str = state["model_path"]
+    hardware: str = state["hardware"]
+    llama_port: int = int(state["llama_port"])
+    gateway_port: int = int(state["gateway_port"])
+    group_policy: str = state["group_policy"]
+
+    model_stem = Path(model_path).stem.lower()
+    model_name = Path(model_path).name
+
+    # Dirs
+    conf_dir = Path.home() / f".nanobot-{bot_name}"
+    workspace_dir = conf_dir / "workspace"
+    sessions_dir = workspace_dir / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. nanobot config.json — copy eng-1 config, patch fields
+    src_conf = Path.home() / ".nanobot" / "config.json"
+    try:
+        nc = json.loads(src_conf.read_text())
+    except Exception:
+        nc = {}
+
+    # Patch model + workspace
+    nc.setdefault("agents", {}).setdefault("defaults", {})["model"] = model_stem
+    nc["agents"]["defaults"]["workspace"] = str(workspace_dir)
+
+    # Patch HTTP port
+    nc.setdefault("channels", {}).setdefault("http", {})["port"] = gateway_port
+    nc["channels"]["http"]["enabled"] = True
+
+    # Patch gateway port
+    nc.setdefault("gateway", {})["port"] = gateway_port
+
+    # Patch Discord group policy
+    nc["channels"].setdefault("discord", {})["groupPolicy"] = group_policy
+
+    conf_file = conf_dir / "config.json"
+    conf_file.write_text(json.dumps(nc, indent=2))
+
+    # 2. llama-server service file
+    llama_templates = {"cuda": _WIZARD_LLAMA_CUDA, "rocm": _WIZARD_LLAMA_ROCM, "cpu": _WIZARD_LLAMA_CPU}
+    llama_svc_content = llama_templates[hardware].format(
+        bot_name=bot_name,
+        model_name=model_name,
+        model_path=model_path,
+        llama_port=llama_port,
+    )
+    llama_svc_file = Path.home() / f".config/systemd/user/llama-server-{bot_name}.service"
+    llama_svc_file.write_text(llama_svc_content)
+
+    # 3. nanobot service file
+    nanobot_svc_content = _WIZARD_NANOBOT_SVC.format(bot_name=bot_name)
+    nanobot_svc_file = Path.home() / f".config/systemd/user/nanobot-{bot_name}.service"
+    nanobot_svc_file.write_text(nanobot_svc_content)
+
+    return (
+        f"✅ **New bot `{bot_name}` created!**\n\n"
+        f"  Model: `{model_name}` ({hardware.upper()})\n"
+        f"  llama-server port: `{llama_port}`\n"
+        f"  Gateway port: `{gateway_port}`\n"
+        f"  Config: `~/.nanobot-{bot_name}/config.json`\n\n"
+        f"**To start:**\n"
+        f"```\n"
+        f"systemctl --user daemon-reload\n"
+        f"systemctl --user enable --now llama-server-{bot_name}.service\n"
+        f"systemctl --user enable --now nanobot-{bot_name}.service\n"
+        f"```\n"
+        f"_(Edit `~/.nanobot-{bot_name}/config.json` to add MCP servers, Discord token, etc.)_"
+    )
+
+
+def _wizard_step(state: dict, user_input: str) -> tuple[dict | None, str]:
+    """Process one wizard step. Returns (new_state, response). new_state=None means done/cancel."""
+    step = state.get("step", 1)
+
+    if user_input.lower() in ("cancel", "abort", "quit", "exit"):
+        return None, "❌ New bot wizard cancelled."
+
+    if step == 1:
+        # Expecting: bot name
+        name = user_input.strip().lower()
+        if not re.match(r'^[a-z0-9][a-z0-9\-]{1,20}$', name):
+            return state, "⚠️ Name must be 2–21 chars, lowercase letters/numbers/hyphens, starting with a letter or number. Try again:"
+        if (Path.home() / f".nanobot-{name}").exists():
+            return state, f"⚠️ Bot `{name}` already exists (`~/.nanobot-{name}/` found). Choose a different name:"
+        new_state = {**state, "step": 2, "name": name}
+        model_list = _wizard_list_models()
+        return new_state, (
+            f"✅ Bot name: `{name}`\n\n"
+            f"**Step 2/6** — Which model?\n{model_list}\n\n"
+            f"Type the model name or a partial match (e.g. `ministral`, `omnicoder`):"
+        )
+
+    if step == 2:
+        # Expecting: model query
+        model_path = _wizard_find_model(user_input.strip())
+        if model_path is None:
+            return state, f"⚠️ No model matching `{user_input.strip()}`. Try again (or `!models` to see list):"
+        new_state = {**state, "step": 3, "model_path": str(model_path)}
+        return new_state, (
+            f"✅ Model: `{model_path.name}`\n\n"
+            f"**Step 3/6** — Hardware:\n"
+            f"  `cuda` — GTX 1070 (CUDA, port 8080)\n"
+            f"  `rocm` — RX 480 (ROCm, pure transformers only)\n"
+            f"  `cpu`  — CPU only (slow, for small models)\n\n"
+            f"Type `cuda`, `rocm`, or `cpu`:"
+        )
+
+    if step == 3:
+        # Expecting: hardware
+        hw = user_input.strip().lower()
+        if hw not in ("cuda", "rocm", "cpu"):
+            return state, "⚠️ Type `cuda`, `rocm`, or `cpu`:"
+        if hw == "rocm":
+            model_name = Path(state.get("model_path", "")).name.lower()
+            for kw in ("mamba", "rwkv", "jamba", "zamba", "falcon-mamba"):
+                if kw in model_name:
+                    return state, f"⚠️ `{model_name}` may be SSM/Mamba which crashes on RX 480. Choose `cuda` or `cpu`, or pick a different model. Re-enter hardware:"
+        new_state = {**state, "step": 4, "hardware": hw}
+        return new_state, (
+            f"✅ Hardware: `{hw}`\n\n"
+            f"**Step 4/6** — llama-server port? (default: `8084`)\n"
+            f"Current ports in use: 8080 (eng-1), 8083 (eng-2), 8082 (lore)\n\n"
+            f"Type a port number or press Enter for `8084`:"
+        )
+
+    if step == 4:
+        # Expecting: llama port
+        raw = user_input.strip()
+        port = 8084 if not raw or raw.lower() in ("enter", "default", "") else None
+        try:
+            if raw:
+                port = int(raw)
+        except ValueError:
+            pass
+        if port is None or not (1024 <= port <= 65535):
+            return state, "⚠️ Enter a valid port number (1024–65535) or leave blank for `8084`:"
+        new_state = {**state, "step": 5, "llama_port": port}
+        return new_state, (
+            f"✅ llama-server port: `{port}`\n\n"
+            f"**Step 5/6** — nanobot gateway port? (default: `18794`)\n"
+            f"Current: 18790 (eng-1), 18792 (eng-2), 18793 (arch-1)\n\n"
+            f"Type a port number or press Enter for `18794`:"
+        )
+
+    if step == 5:
+        # Expecting: gateway port
+        raw = user_input.strip()
+        port = 18794 if not raw or raw.lower() in ("enter", "default", "") else None
+        try:
+            if raw:
+                port = int(raw)
+        except ValueError:
+            pass
+        if port is None or not (1024 <= port <= 65535):
+            return state, "⚠️ Enter a valid port number (1024–65535) or leave blank for `18794`:"
+        new_state = {**state, "step": 6, "gateway_port": port}
+        return new_state, (
+            f"✅ Gateway port: `{port}`\n\n"
+            f"**Step 6/6** — Discord group policy?\n"
+            f"  `mention` — bot only responds when @mentioned (default)\n"
+            f"  `open`    — bot responds to all messages in channel\n\n"
+            f"Type `mention` or `open`:"
+        )
+
+    if step == 6:
+        # Expecting: group policy
+        policy = user_input.strip().lower()
+        if policy not in ("mention", "open"):
+            return state, "⚠️ Type `mention` or `open`:"
+        state["group_policy"] = policy
+        try:
+            result = _wizard_generate(state)
+        except Exception as e:
+            return None, f"❌ Failed to generate bot files: {e}"
+        return None, result
+
+    return None, "❌ Unknown wizard state. Type `!new-nanobot` to restart."
+
+
 def _cmd_models() -> str:
     """List available .gguf models in ~/models/."""
     import subprocess
@@ -968,9 +1292,36 @@ class AgentLoop:
             self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
+        # ── New-nanobot wizard (intercepts all messages while active) ──────────
+        if cmd == "!new-nanobot cancel":
+            _wizard_clear()
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="❌ New bot wizard cancelled.")
+
+        if cmd == "!new-nanobot":
+            _wizard_clear()
+            _wizard_save({"step": 1})
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=(
+                                      "🤖 **New nanobot wizard** — Step 1/6\n\n"
+                                      "What should this bot be called?\n"
+                                      "Use lowercase letters, numbers, hyphens (e.g. `researcher`, `eng-3`)\n\n"
+                                      "_(Type `cancel` at any step to abort)_"
+                                  ))
+
+        _wizard_state = _wizard_load()
+        if _wizard_state is not None:
+            new_wiz_state, wiz_response = _wizard_step(_wizard_state, msg.content)
+            if new_wiz_state is None:
+                _wizard_clear()
+            else:
+                _wizard_save(new_wiz_state)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=wiz_response)
+
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!summarize <url> — Fetch and summarize any webpage\n!gh <owner/repo> — GitHub repo info + latest release\n!diff — Show nanobot changes since upstream sync\n!mad-code-summary <path> — Summarize a file's purpose\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!new-nanobot — Interactive wizard to create a new bot config + service files\n!summarize <url> — Fetch and summarize any webpage\n!gh <owner/repo> — GitHub repo info + latest release\n!diff — Show nanobot changes since upstream sync\n!mad-code-summary <path> — Summarize a file's purpose\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
 
         if cmd == "!status":
             return OutboundMessage(
