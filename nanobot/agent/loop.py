@@ -1512,8 +1512,14 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
-        # Slash commands
-        cmd = msg.content.strip().lower()
+        # Slash commands — strip leading @mention if present (e.g. "@bot-name !cmd")
+        _content_stripped = msg.content.strip()
+        if _content_stripped.startswith("@"):
+            # Drop the @mention token, leave the rest
+            _parts = _content_stripped.split(None, 1)
+            _content_stripped = _parts[1].strip() if len(_parts) > 1 else ""
+            msg.content = _content_stripped  # strip mention from LLM path too
+        cmd = _content_stripped.lower()
         if cmd in ("/new", "/reset", "!reset"):
             try:
                 if not await self.memory_consolidator.archive_unconsolidated(session):
