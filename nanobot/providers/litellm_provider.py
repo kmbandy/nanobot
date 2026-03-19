@@ -336,6 +336,14 @@ class LiteLLMProvider(LLMProvider):
         if tool_calls is None and content:
             tool_calls, content = LiteLLMProvider._extract_text_tool_calls(content)
 
+        # Strip EOS/EOT tokens that some models (e.g. Ministral via llama.cpp) leak
+        # into response content. If stored in history they break Jinja chat templating
+        # on the next request.
+        if content:
+            for tok in ("<|im_end|>", "<|endoftext|>", "</s>", "<|eot_id|>"):
+                content = content.replace(tok, "")
+            content = content.rstrip() or None
+
         reasoning_content = getattr(message, "reasoning_content", None) or None
         thinking_blocks = getattr(message, "thinking_blocks", None) or None
 

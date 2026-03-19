@@ -59,6 +59,16 @@ class DingTalkConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
 
 
+class HttpConfig(Base):
+    """HTTP channel configuration — exposes /v1/chat/completions for direct bot messaging."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"  # 127.0.0.1 for loopback-only; 0.0.0.0 for LAN (e.g. 27b)
+    port: int = 18790
+    api_key: str = ""  # Bearer token required on all requests (empty = no auth)
+    allow_from: list[str] = Field(default_factory=lambda: ["*"])  # auth handled by api_key
+
+
 class DiscordConfig(Base):
     """Discord channel configuration."""
 
@@ -215,6 +225,7 @@ class ChannelsConfig(Base):
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    http: HttpConfig = Field(default_factory=HttpConfig)
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -356,6 +367,7 @@ class MCPServerConfig(Base):
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
+    allow_tools: list[str] = Field(default_factory=list)  # if non-empty, only register these tools
 
 
 class ToolsConfig(Base):
@@ -365,6 +377,7 @@ class ToolsConfig(Base):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     nvidia: NvidiaConfig = Field(default_factory=NvidiaConfig)
     cf_crawl: CfCrawlConfig = Field(default_factory=CfCrawlConfig)
+    sysmon: bool = True  # Set false to disable the sysmon tool
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
