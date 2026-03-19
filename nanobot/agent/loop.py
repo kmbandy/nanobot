@@ -107,6 +107,88 @@ def _build_reddit_prompt(raw: str) -> str:
     )
 
 
+def _build_search_prompt(raw: str) -> str:
+    """Parse '!search <query>' and return a guardrailed web search prompt."""
+    idx = raw.lower().find("!search ")
+    query = raw[idx + len("!search "):].strip() if idx != -1 else raw.strip()
+    return (
+        f'Search the web for "{query}". '
+        f"Find the 5 most relevant results. "
+        f"For each one write a 2-3 sentence summary including the source. "
+        f"Rules: do at most 3 searches, do not write to memory. "
+        f"Once you have 5 summaries, stop immediately and present them."
+    )
+
+
+def _build_arxiv_prompt(raw: str) -> str:
+    """Parse '!arxiv <query>' and return an arxiv search prompt."""
+    idx = raw.lower().find("!arxiv ")
+    query = raw[idx + len("!arxiv "):].strip() if idx != -1 else raw.strip()
+    return (
+        f'Search arxiv.org for papers related to "{query}". '
+        f"Use web_search with site:arxiv.org. "
+        f"Find the 5 most relevant recent papers. "
+        f"For each paper give: title, one-sentence summary, and URL. "
+        f"Rules: do at most 3 searches, do not write to memory. "
+        f"Once you have 5 papers, stop immediately and present them."
+    )
+
+
+_RESTART_TARGETS: dict[str, tuple[str, str]] = {
+    "eng-1":  ("nanobot-eng-1",  "nanobot.service"),
+    "eng-2":  ("nanobot-eng-2",  "nanobot-8b.service"),
+    "arch-1": ("nanobot-arch-1", "nanobot-27b.service"),
+}
+
+
+def _cmd_restart(raw: str) -> str:
+    """Handle '!restart <bot>' — restart a fleet service."""
+    import subprocess, os
+    from pathlib import Path as _Path
+
+    idx = raw.lower().find("!restart ")
+    target = raw[idx + len("!restart "):].strip().lower() if idx != -1 else ""
+
+    if target not in _RESTART_TARGETS:
+        valid = ", ".join(_RESTART_TARGETS)
+        return f"❌ Unknown bot `{target}`. Valid targets: {valid}"
+
+    friendly, service = _RESTART_TARGETS[target]
+
+    # Fix D-Bus so systemctl --user works
+    if "DBUS_SESSION_BUS_ADDRESS" not in os.environ:
+        candidate = f"/run/user/{os.getuid()}/bus"
+        if _Path(candidate).exists():
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={candidate}"
+
+    # Clear session files before restart to prevent loop resume
+    session_dirs = {
+        "nanobot.service":     _Path.home() / ".nanobot"     / "workspace" / "sessions",
+        "nanobot-8b.service":  _Path.home() / ".nanobot-8b"  / "workspace" / "sessions",
+        "nanobot-27b.service": _Path.home() / ".nanobot-27b" / "workspace" / "sessions",
+    }
+    sessions_dir = session_dirs.get(service)
+    cleared = 0
+    if sessions_dir and sessions_dir.exists():
+        for f in sessions_dir.glob("*.json*"):
+            try:
+                f.unlink()
+                cleared += 1
+            except Exception:
+                pass
+
+    r = subprocess.run(
+        ["systemctl", "--user", "restart", service],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        err = r.stderr.decode().strip()
+        return f"❌ Failed to restart `{friendly}`: {err}"
+
+    session_note = f" (cleared {cleared} session file(s))" if cleared else ""
+    return f"♻️ `{friendly}` restarted{session_note}."
+
+
 async def _cmd_brief() -> str:
     """Run morning-brief --stdout and return the brief text."""
     import sys
@@ -538,7 +620,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history and start fresh\n/stop — Stop the current task\n/help — Show available commands\n!status — Fleet hardware + agent status\n!tasks — Pending tasks in the pipeline\n!ping — Check which bots are alive and their state\n!brief — On-demand overnight summary")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops")
 
         if cmd == "!status":
             return OutboundMessage(
@@ -566,6 +648,18 @@ class AgentLoop:
 
         if cmd.startswith("!reddit "):
             msg.content = _build_reddit_prompt(msg.content)
+
+        elif cmd.startswith("!search "):
+            msg.content = _build_search_prompt(msg.content)
+
+        elif cmd.startswith("!arxiv "):
+            msg.content = _build_arxiv_prompt(msg.content)
+
+        elif cmd.startswith("!restart "):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=_cmd_restart(msg.content),
+            )
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
