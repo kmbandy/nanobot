@@ -493,7 +493,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history and start fresh\n/stop — Stop the current task\n/help — Show available commands\n!status — Fleet hardware + agent status\n!tasks — Pending tasks in the pipeline")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history and start fresh\n/stop — Stop the current task\n/help — Show available commands\n!status — Fleet hardware + agent status\n!tasks — Pending tasks in the pipeline\n!ping — Check which bots are alive and their state")
 
         if cmd == "!status":
             return OutboundMessage(
@@ -505,6 +505,12 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=await _cmd_tasks(),
+            )
+
+        if cmd == "!ping":
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=self._cmd_ping(msg.session_key),
             )
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
@@ -550,6 +556,57 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
         )
+
+    def _cmd_ping(self, session_key: str) -> str:
+        """Return a one-liner pong for !ping, identifying this bot instance."""
+        import subprocess
+
+        # Derive friendly bot name from workspace path
+        ws = str(self.workspace)
+        if ".nanobot-27b" in ws:
+            bot_name = "nanobot-arch-1"
+            service  = "nanobot-27b.service"
+        elif ".nanobot-8b" in ws:
+            bot_name = "nanobot-eng-2"
+            service  = "nanobot-8b.service"
+        else:
+            bot_name = "nanobot-eng-1"
+            service  = "nanobot.service"
+
+        # State: any active tasks for this session?
+        busy = bool(self._active_tasks.get(session_key))
+        state = "🔄 working" if busy else "💤 idle"
+
+        # Service uptime via systemctl
+        uptime_str = ""
+        try:
+            out = subprocess.check_output(
+                ["systemctl", "--user", "show", service,
+                 "--property=ActiveEnterTimestamp"],
+                text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+            # "ActiveEnterTimestamp=Thu 2026-03-19 00:49:42 EDT"
+            val = out.split("=", 1)[-1].strip()
+            if val and val != "n/a":
+                from datetime import datetime, timezone
+                # Parse systemd timestamp — try common formats
+                for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S"):
+                    try:
+                        started = datetime.strptime(val, fmt).replace(tzinfo=timezone.utc)
+                        secs = int((datetime.now(timezone.utc) - started).total_seconds())
+                        if secs < 3600:
+                            uptime_str = f" | up {secs // 60}m"
+                        elif secs < 86400:
+                            uptime_str = f" | up {secs // 3600}h {(secs % 3600) // 60}m"
+                        else:
+                            uptime_str = f" | up {secs // 86400}d {(secs % 86400) // 3600}h"
+                        break
+                    except ValueError:
+                        continue
+        except Exception:
+            pass
+
+        return f"🏓 **{bot_name}** — {state} | `{self.model}`{uptime_str}"
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
