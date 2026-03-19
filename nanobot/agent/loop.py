@@ -607,7 +607,8 @@ async def _cmd_united() -> str:
         reqs = [
             client.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/teams/{MAN_UTD_ID}/schedule"),
             client.get("https://site.api.espn.com/apis/v2/sports/soccer/eng.1/standings"),
-            client.get("https://www.reddit.com/r/manchesterunited/hot.json?limit=15&raw_json=1"),
+            client.get("https://www.reddit.com/r/manchesterunited/hot.json?limit=15&raw_json=1",
+                       headers={"User-Agent": "mad-lab-bot:united-latest:v1.0 (by /u/mad_lab_bot)"}),
         ] + [
             client.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={s}-{e}&limit=100")
             for s, e in week_ranges
