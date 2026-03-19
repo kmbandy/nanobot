@@ -79,6 +79,23 @@ async def _cmd_status() -> str:
     return "\n".join(lines)
 
 
+async def _cmd_brief() -> str:
+    """Run morning-brief --stdout and return the brief text."""
+    import sys
+    brief_script = Path.home() / "mad-lab-mcp" / "bin" / "morning-brief"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(brief_script), "--stdout",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        text = stdout.decode().strip()
+        return text or "📨 Brief generated but was empty."
+    except Exception as e:
+        return f"❌ Brief failed: {e}"
+
+
 async def _cmd_tasks() -> str:
     """Query ChromaDB for pending tasks and format for Discord."""
     try:
@@ -493,7 +510,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history and start fresh\n/stop — Stop the current task\n/help — Show available commands\n!status — Fleet hardware + agent status\n!tasks — Pending tasks in the pipeline\n!ping — Check which bots are alive and their state")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history and start fresh\n/stop — Stop the current task\n/help — Show available commands\n!status — Fleet hardware + agent status\n!tasks — Pending tasks in the pipeline\n!ping — Check which bots are alive and their state\n!brief — On-demand overnight summary")
 
         if cmd == "!status":
             return OutboundMessage(
@@ -511,6 +528,12 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=self._cmd_ping(msg.session_key),
+            )
+
+        if cmd == "!brief":
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=await _cmd_brief(),
             )
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
