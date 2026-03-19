@@ -290,6 +290,150 @@ def _build_arxiv_prompt(raw: str) -> str:
     )
 
 
+def _build_summarize_prompt(raw: str) -> str | None:
+    """Fetch URL and build a summarize prompt. Returns None on fetch error."""
+    import httpx
+
+    idx = raw.lower().find("!summarize ")
+    url = raw[idx + len("!summarize "):].strip() if idx != -1 else raw.strip()
+    url = url.split()[0] if url else ""
+    if not url:
+        return None
+
+    try:
+        resp = httpx.get(
+            url,
+            follow_redirects=True,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+        )
+        resp.raise_for_status()
+        html = resp.text
+    except Exception:
+        return None
+
+    text = re.sub(r'<[^>]+>', ' ', html)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return f"Please summarize the following web content from {url}:\n\n{text[:8000]}"
+
+
+async def _cmd_gh(raw: str) -> str:
+    """Fetch GitHub repo info and latest release."""
+    import httpx
+
+    idx = raw.lower().find("!gh ")
+    slug = raw[idx + len("!gh "):].strip() if idx != -1 else raw.strip()
+    slug = slug.split()[0] if slug else ""
+    if not slug:
+        return "Usage: `!gh <owner/repo>`"
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            repo_resp = await client.get(
+                f"https://api.github.com/repos/{slug}",
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            repo_resp.raise_for_status()
+            repo = repo_resp.json()
+
+            release_tag = "none"
+            release_date = ""
+            try:
+                rel_resp = await client.get(
+                    f"https://api.github.com/repos/{slug}/releases/latest",
+                    headers={"Accept": "application/vnd.github+json"},
+                )
+                if rel_resp.status_code == 200:
+                    rel = rel_resp.json()
+                    release_tag = rel.get("tag_name", "?")
+                    release_date = (rel.get("published_at", "") or "")[:10]
+            except Exception:
+                pass
+    except Exception:
+        return f"❌ Repo not found or API error: `{slug}`"
+
+    description = repo.get("description") or "No description"
+    stars = repo.get("stargazers_count", 0)
+    forks = repo.get("forks_count", 0)
+    issues = repo.get("open_issues_count", 0)
+    html_url = repo.get("html_url", f"https://github.com/{slug}")
+    full_name = repo.get("full_name", slug)
+    release_line = f"📅 Latest: {release_tag} ({release_date})" if release_date else f"📅 Latest: {release_tag}"
+    return (
+        f"📦 **{full_name}** — {description}\n"
+        f"⭐ {stars}  🍴 {forks}  🐛 {issues} open issues\n"
+        f"{release_line}\n"
+        f"🔗 {html_url}"
+    )
+
+
+def _cmd_diff() -> str:
+    """Show nanobot changes since upstream/main."""
+    import subprocess
+
+    nanobot_root = Path(__file__).parent.parent.parent
+
+    def _run(args: list[str]) -> str:
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            return r.stdout.strip()
+        except Exception:
+            return ""
+
+    log_out = _run(["git", "-C", str(nanobot_root), "log", "--oneline", "upstream/main..HEAD"])
+    if log_out:
+        diff_stat = _run(["git", "-C", str(nanobot_root), "diff", "--stat", "upstream/main..HEAD"])
+        header = "📋 **nanobot changes since upstream/main:**"
+    else:
+        log_out = _run(["git", "-C", str(nanobot_root), "log", "--oneline", "-10"])
+        diff_stat = ""
+        header = "📋 **nanobot log** (last 10 — upstream/main not found):"
+
+    result = f"{header}\n```\n{log_out[:1800]}\n```"
+    if diff_stat:
+        result += f"\n```\n{diff_stat[:400]}\n```"
+    return result
+
+
+def _build_code_summary_prompt(raw: str) -> str | None:
+    """Read a file from mad-lab repos and build an LLM summary prompt."""
+    idx = raw.lower().find("!mad-code-summary ")
+    path_str = raw[idx + len("!mad-code-summary "):].strip() if idx != -1 else raw.strip()
+    path_str = path_str.split()[0] if path_str else ""
+    if not path_str:
+        return None
+
+    # Resolve path — check as-is, then relative to ~/mad-lab-mcp and ~/nanobot
+    candidates = [
+        Path(path_str),
+        Path.home() / path_str,
+        Path.home() / "mad-lab-mcp" / path_str,
+        Path.home() / "nanobot" / path_str,
+    ]
+    resolved: Path | None = None
+    for c in candidates:
+        try:
+            if c.exists() and c.is_file():
+                resolved = c
+                break
+        except Exception:
+            continue
+
+    if resolved is None:
+        return f"__NOT_FOUND__:{path_str}"
+
+    try:
+        content = resolved.read_text(errors="replace")[:6000]
+    except Exception:
+        return None
+
+    return (
+        f"Please summarize the purpose and functionality of this file: `{resolved}`\n\n"
+        f"Focus on: what it does, key functions/classes, how it fits in the project.\n\n"
+        f"```\n{content}\n```"
+    )
+
+
 _RESTART_TARGETS: dict[str, tuple[str, str]] = {
     "eng-1":  ("nanobot-eng-1",  "nanobot.service"),
     "eng-2":  ("nanobot-eng-2",  "nanobot-8b.service"),
@@ -826,7 +970,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!summarize <url> — Fetch and summarize any webpage\n!gh <owner/repo> — GitHub repo info + latest release\n!diff — Show nanobot changes since upstream sync\n!mad-code-summary <path> — Summarize a file's purpose\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
 
         if cmd == "!status":
             return OutboundMessage(
@@ -872,6 +1016,42 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=await _cmd_mem(msg.content),
             )
+
+        if cmd == "!diff":
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=_cmd_diff(),
+            )
+
+        if cmd.startswith("!gh "):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=await _cmd_gh(msg.content),
+            )
+
+        if cmd.startswith("!summarize "):
+            result = _build_summarize_prompt(msg.content)
+            if result is None:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="❌ Failed to fetch URL. Check the address and try again.",
+                )
+            msg.content = result
+
+        if cmd.startswith("!mad-code-summary "):
+            result = _build_code_summary_prompt(msg.content)
+            if result is None:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="❌ Failed to read file.",
+                )
+            if isinstance(result, str) and result.startswith("__NOT_FOUND__:"):
+                fname = result.split(":", 1)[1]
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"❌ File not found: `{fname}`\nTry a path relative to ~/mad-lab-mcp/ or ~/nanobot/",
+                )
+            msg.content = result
 
         if cmd == "!models":
             return OutboundMessage(
