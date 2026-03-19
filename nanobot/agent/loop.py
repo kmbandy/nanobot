@@ -107,6 +107,146 @@ def _build_reddit_prompt(raw: str) -> str:
     )
 
 
+def _build_explain_prompt(raw: str) -> str:
+    """Parse '!explain <code or description>' and return a focused explanation prompt."""
+    idx = raw.lower().find("!explain ")
+    content = raw[idx + len("!explain "):].strip() if idx != -1 else raw.strip()
+    return (
+        f"Explain the following clearly and concisely:\n\n{content}\n\n"
+        f"If it's code: describe what it does, how it works, and any gotchas. "
+        f"If it's a concept: give a plain-English explanation with a brief example. "
+        f"Keep it focused — no tangents. Do not write to memory."
+    )
+
+
+async def _cmd_mem(raw: str) -> str:
+    """Search ChromaDB and format top results for Discord."""
+    idx = raw.lower().find("!mem ")
+    query = raw[idx + len("!mem "):].strip() if idx != -1 else raw.strip()
+    if not query:
+        return "Usage: `!mem <search query>`"
+    try:
+        import chromadb
+        from pathlib import Path as _Path
+        client = chromadb.PersistentClient(path=str(_Path.home() / ".mad-lab-mcp" / "chromadb"))
+        col = client.get_collection("memory")
+        r = col.query(
+            query_texts=[query],
+            n_results=min(5, col.count() or 1),
+            include=["metadatas", "documents", "distances"],
+        )
+    except Exception as e:
+        return f"❌ Memory search failed: {e}"
+
+    ids       = r["ids"][0]
+    metas     = r["metadatas"][0]
+    docs      = r["documents"][0]
+    distances = r["distances"][0]
+
+    if not ids:
+        return f"🧠 No results for `{query}`"
+
+    lines = [f"🧠 **Memory search:** `{query}`\n"]
+    for doc_id, meta, doc, dist in zip(ids, metas, docs, distances):
+        score = max(0.0, 1.0 - dist)
+        dtype = meta.get("type", "?")
+        ts    = meta.get("timestamp", "")[:10]
+        preview = doc.replace("\n", " ").strip()[:120]
+        lines.append(f"`{doc_id[:8]}` [{dtype}] {score:.2f}  *{ts}*\n{preview}\n")
+
+    return "\n".join(lines)[:2000]
+
+
+def _cmd_remind(raw: str) -> str:
+    """Schedule a Discord reminder. Format: !remind <time> <message>
+    Time: 5m, 30m, 1h, 2h, etc."""
+    import re, json
+    from pathlib import Path as _Path
+
+    idx = raw.lower().find("!remind ")
+    after = raw[idx + len("!remind "):].strip() if idx != -1 else ""
+
+    # Parse time token: 5m, 30m, 1h, 2h30m, etc.
+    m = re.match(r'^((?:\d+h)?(?:\d+m)?)\s+(.+)', after, re.IGNORECASE)
+    if not m or not m.group(1):
+        return (
+            "Usage: `!remind <time> <message>`\n"
+            "Examples: `!remind 20m check on arch-1`  `!remind 1h30m restart scraper`"
+        )
+
+    time_str = m.group(1).lower()
+    reminder_msg = m.group(2).strip()
+
+    # Parse total minutes
+    hours   = int(re.search(r'(\d+)h', time_str).group(1)) if 'h' in time_str else 0
+    minutes = int(re.search(r'(\d+)m', time_str).group(1)) if 'm' in time_str else 0
+    total_minutes = hours * 60 + minutes
+    if total_minutes < 1:
+        return "❌ Minimum remind time is 1 minute."
+    if total_minutes > 1440:
+        return "❌ Maximum remind time is 24 hours."
+
+    # Write a one-shot reminder script
+    reminders_dir = _Path.home() / ".mad-lab-mcp" / "reminders"
+    reminders_dir.mkdir(exist_ok=True)
+
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    fire_at = _dt.now(_tz.utc) + _td(minutes=total_minutes)
+    stamp   = fire_at.strftime("%Y%m%d_%H%M%S")
+    script  = reminders_dir / f"remind_{stamp}.py"
+
+    # Load Discord config
+    conf_path = _Path.home() / ".mad-lab-mcp" / "supervisor.conf"
+    nanobot_conf = _Path.home() / ".nanobot" / "config.json"
+    conf = {}
+    if conf_path.exists():
+        for line in conf_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                conf[k.strip()] = v.strip()
+    token = conf.get("DISCORD_TOKEN", "")
+    if not token:
+        try:
+            c = json.loads(nanobot_conf.read_text())
+            token = c.get("channels", {}).get("discord", {}).get("token", "")
+        except Exception:
+            pass
+    channel = conf.get("DISCORD_ALERT_CHANNEL", "")
+
+    script.write_text(
+        f'#!/usr/bin/env python3\n'
+        f'import httpx, os\n'
+        f'from pathlib import Path\n'
+        f'msg = "⏰ **Reminder:** {reminder_msg}"\n'
+        f'r = httpx.post("https://discord.com/api/v10/channels/{channel}/messages",\n'
+        f'    headers={{"Authorization": "Bot {token}"}},\n'
+        f'    json={{"content": msg}}, timeout=10)\n'
+        f'# Self-destruct\n'
+        f'Path(__file__).unlink(missing_ok=True)\n'
+        f'# Remove own cron entry\n'
+        f'import subprocess\n'
+        f'cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout\n'
+        f'cron = "\\n".join(l for l in cron.splitlines() if "{script.name}" not in l)\n'
+        f'subprocess.run(["crontab", "-"], input=cron, text=True)\n'
+    )
+    script.chmod(0o755)
+
+    # Add cron entry at the right time
+    cron_min  = fire_at.minute
+    cron_hour = fire_at.hour
+    cron_dom  = fire_at.day
+    cron_mon  = fire_at.month
+    import subprocess as _sp
+    current = _sp.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    new_line = f"{cron_min} {cron_hour} {cron_dom} {cron_mon} * /usr/bin/python3 {script} >> /home/kmbandy/.mad-lab-mcp/reminders/remind.log 2>&1"
+    _sp.run(["crontab", "-"], input=current.rstrip() + "\n" + new_line + "\n", text=True)
+
+    human = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+    fire_local = fire_at.strftime("%H:%M UTC")
+    return f"⏰ Reminder set for **{human}** from now ({fire_local}): *{reminder_msg}*"
+
+
 def _build_python_prompt(raw: str) -> str:
     """Parse '!python <description>' and return a focused code generation prompt."""
     idx = raw.lower().find("!python ")
@@ -636,7 +776,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function")
+                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
 
         if cmd == "!status":
             return OutboundMessage(
@@ -673,6 +813,21 @@ class AgentLoop:
 
         elif cmd.startswith("!python "):
             msg.content = _build_python_prompt(msg.content)
+
+        elif cmd.startswith("!explain "):
+            msg.content = _build_explain_prompt(msg.content)
+
+        if cmd.startswith("!mem "):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=await _cmd_mem(msg.content),
+            )
+
+        if cmd.startswith("!remind "):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=_cmd_remind(msg.content),
+            )
 
         elif cmd.startswith("!restart "):
             return OutboundMessage(
