@@ -14,50 +14,6 @@ class Base(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
-class WhatsAppConfig(Base):
-    """WhatsApp channel configuration."""
-
-    enabled: bool = False
-    bridge_url: str = "ws://localhost:3001"
-    bridge_token: str = ""  # Shared token for bridge auth (optional, recommended)
-    allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
-
-
-class TelegramConfig(Base):
-    """Telegram channel configuration."""
-
-    enabled: bool = False
-    token: str = ""  # Bot token from @BotFather
-    allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
-    proxy: str | None = (
-        None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
-    )
-    reply_to_message: bool = False  # If true, bot replies quote the original message
-    group_policy: Literal["open", "mention"] = "mention"  # "mention" responds when @mentioned or replied to, "open" responds to all
-
-
-class FeishuConfig(Base):
-    """Feishu/Lark channel configuration using WebSocket long connection."""
-
-    enabled: bool = False
-    app_id: str = ""  # App ID from Feishu Open Platform
-    app_secret: str = ""  # App Secret from Feishu Open Platform
-    encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
-    verification_token: str = ""  # Verification Token for event subscription (optional)
-    allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
-    react_emoji: str = (
-        "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
-    )
-
-
-class DingTalkConfig(Base):
-    """DingTalk channel configuration using Stream mode."""
-
-    enabled: bool = False
-    client_id: str = ""  # AppKey
-    client_secret: str = ""  # AppSecret
-    allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
-
 
 class HttpConfig(Base):
     """HTTP channel configuration — exposes /v1/chat/completions for direct bot messaging."""
@@ -75,6 +31,7 @@ class DiscordConfig(Base):
     enabled: bool = False
     token: str = ""  # Bot token from Discord Developer Portal
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
+    allow_bots: list[str] = Field(default_factory=list)  # Bot user IDs allowed to send messages
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
     group_policy: Literal["mention", "open"] = "mention"
@@ -221,22 +178,17 @@ class WecomConfig(Base):
 
 
 class ChannelsConfig(Base):
-    """Configuration for chat channels."""
+    """Configuration for chat channels.
+
+    Built-in and plugin channel configs are stored as extra fields (dicts).
+    Each channel parses its own config in __init__.
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
     http: HttpConfig = Field(default_factory=HttpConfig)
-    whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
-    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
-    discord: DiscordConfig = Field(default_factory=DiscordConfig)
-    feishu: FeishuConfig = Field(default_factory=FeishuConfig)
-    mochat: MochatConfig = Field(default_factory=MochatConfig)
-    dingtalk: DingTalkConfig = Field(default_factory=DingTalkConfig)
-    email: EmailConfig = Field(default_factory=EmailConfig)
-    slack: SlackConfig = Field(default_factory=SlackConfig)
-    qq: QQConfig = Field(default_factory=QQConfig)
-    matrix: MatrixConfig = Field(default_factory=MatrixConfig)
-    wecom: WecomConfig = Field(default_factory=WecomConfig)
 
 
 class AgentDefaults(Base):
@@ -251,17 +203,7 @@ class AgentDefaults(Base):
     context_window_tokens: int = 65_536
     temperature: float = 0.1
     max_tool_iterations: int = 40
-    # Deprecated compatibility field: accepted from old configs but ignored at runtime.
-    memory_window: int | None = Field(default=None, exclude=True)
-    reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
-    memory_max_chars: int = 8000
-    memory_max_tokens: int = 2000
-    memory_compaction_enabled: bool = True
-
-    @property
-    def should_warn_deprecated_memory_window(self) -> bool:
-        """Return True when old memoryWindow is present without contextWindowTokens."""
-        return self.memory_window is not None and "context_window_tokens" not in self.model_fields_set
+    reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
 
 
 class AgentsConfig(Base):
@@ -290,15 +232,18 @@ class ProvidersConfig(Base):
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
-    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
+    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
-    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
+    volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Coding Plan
+    byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
+    byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
@@ -321,7 +266,9 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    api_key: str = ""  # Brave Search API key
+    provider: str = "brave"  # brave, tavily, duckduckgo, searxng, jina
+    api_key: str = ""
+    base_url: str = ""  # SearXNG base URL
     max_results: int = 5
     searxng_url: str = ""  # SearXNG instance URL, e.g. "http://localhost:8888"
 
@@ -353,9 +300,9 @@ class WebToolsConfig(Base):
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
+    enable: bool = True
     timeout: int = 60
     path_append: str = ""
-
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
@@ -367,8 +314,7 @@ class MCPServerConfig(Base):
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
-    allow_tools: list[str] = Field(default_factory=list)  # if non-empty, only register these tools
-
+    enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
 
 class ToolsConfig(Base):
     """Tools configuration."""
@@ -433,12 +379,21 @@ class Config(BaseSettings):
 
         # Fallback: configured local providers can route models without
         # provider-specific keywords (for example plain "llama3.2" on Ollama).
+        # Prefer providers whose detect_by_base_keyword matches the configured api_base
+        # (e.g. Ollama's "11434" in "http://localhost:11434") over plain registry order.
+        local_fallback: tuple[ProviderConfig, str] | None = None
         for spec in PROVIDERS:
             if not spec.is_local:
                 continue
             p = getattr(self.providers, spec.name, None)
-            if p and p.api_base:
+            if not (p and p.api_base):
+                continue
+            if spec.detect_by_base_keyword and spec.detect_by_base_keyword in p.api_base:
                 return p, spec.name
+            if local_fallback is None:
+                local_fallback = (p, spec.name)
+        if local_fallback:
+            return local_fallback
 
         # Fallback: gateways first, then others (follows registry order)
         # OAuth providers are NOT valid fallbacks — they require explicit model selection
