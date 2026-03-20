@@ -3,9 +3,10 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
+from pydantic import Field
 import websockets
 from loguru import logger
 
@@ -13,12 +14,24 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
-from nanobot.config.schema import DiscordConfig
+from nanobot.config.schema import Base
 from nanobot.utils.helpers import split_message
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
+
+
+class DiscordConfig(Base):
+    """Discord channel configuration."""
+
+    enabled: bool = False
+    token: str = ""
+    allow_from: list[str] = Field(default_factory=list)
+    allow_bots: list[str] = Field(default_factory=list)  # Bot user IDs allowed to send messages
+    gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
+    intents: int = 37377
+    group_policy: Literal["mention", "open"] = "mention"
 
 
 class DiscordChannel(BaseChannel):
@@ -27,7 +40,13 @@ class DiscordChannel(BaseChannel):
     name = "discord"
     display_name = "Discord"
 
-    def __init__(self, config: DiscordConfig, bus: MessageBus):
+    @classmethod
+    def default_config(cls) -> dict[str, Any]:
+        return DiscordConfig().model_dump(by_alias=True)
+
+    def __init__(self, config: Any, bus: MessageBus):
+        if isinstance(config, dict):
+            config = DiscordConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: DiscordConfig = config
         self._ws: websockets.WebSocketClientProtocol | None = None
@@ -270,10 +289,9 @@ class DiscordChannel(BaseChannel):
     async def _handle_message_create(self, payload: dict[str, Any]) -> None:
         """Handle incoming Discord messages."""
         author = payload.get("author") or {}
-        if author.get("bot"):
-            return
-
         sender_id = str(author.get("id", ""))
+        if author.get("bot") and sender_id not in self.config.allow_bots:
+            return
         channel_id = str(payload.get("channel_id", ""))
         content = payload.get("content") or ""
         guild_id = payload.get("guild_id")
