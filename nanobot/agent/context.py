@@ -224,6 +224,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        current_role: str = "user",
     ) -> list[dict[str, Any]]:
         """Build the complete message list with memory compaction for actual LLM calls."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
