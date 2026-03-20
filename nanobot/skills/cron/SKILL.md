@@ -58,4 +58,6 @@ cron(action="remove", job_id="abc123")
 
 ## Timezone
 
+**Always include `tz="America/New_York"` when creating cron jobs with `cron_expr`** — this server runs EDT/EST and explicit timezone prevents drift if the system timezone changes.
+
 Use `tz` with `cron_expr` to schedule in a specific IANA timezone. Without `tz`, the server's local timezone is used.
