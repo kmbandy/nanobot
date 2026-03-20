@@ -151,7 +151,8 @@ class MCPToolWrapper(Tool):
         from mcp import McpError, types
 
         async def _call():
-            session = self._connection.session
+            # Support both MCPServerConnection (has .session) and bare session objects (tests)
+            session = getattr(self._connection, "session", self._connection)
             if session is None:
                 raise RuntimeError("MCP session is not connected")
             return await asyncio.wait_for(
