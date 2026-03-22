@@ -219,6 +219,7 @@ class ProviderConfig(Base):
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
     suppress_tools_param: bool = False  # Don't send tools in API call; rely on text extraction
+    request_timeout: int | None = None  # LLM request timeout in seconds (None = litellm default 600s)
 
 
 class ProvidersConfig(Base):

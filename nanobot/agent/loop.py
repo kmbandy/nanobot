@@ -321,22 +321,68 @@ def _build_summarize_prompt(raw: str) -> str | None:
 
 
 async def _cmd_wikipedia(raw: str) -> str:
-    """Fetch a Wikipedia summary for a subject."""
+    """Fetch a Wikipedia summary for a subject. Tries local Kiwix first, falls back to Wikipedia REST API."""
     import httpx
+    import re
 
     idx = raw.lower().find("!wikipedia ")
     subject = raw[idx + len("!wikipedia "):].strip() if idx != -1 else raw.strip()
     if not subject:
         return "Usage: `!wikipedia <subject>`"
 
-    # Wikipedia REST API — returns clean summary JSON, no parsing needed
+    # --- Try local Kiwix first (offline, faster) ---
+    kiwix_url = "http://localhost:8091"
+    wiki_book = "wikipedia_en_all_maxi_2026-02"
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+            search_resp = await client.get(
+                f"{kiwix_url}/search",
+                params={"pattern": subject, "lang": "eng", "books": wiki_book},
+                headers={"User-Agent": "mad-lab-bot/1.0"},
+            )
+            if search_resp.status_code == 200:
+                from lxml import html as lxml_html
+                dom = lxml_html.fromstring(search_resp.text)
+                links = dom.xpath('//div[@class="results"]//a[@href]')
+                if links:
+                    href = links[0].get("href", "").strip()
+                    article_resp = await client.get(
+                        kiwix_url + href,
+                        headers={"User-Agent": "mad-lab-bot/1.0"},
+                    )
+                    if article_resp.status_code == 200:
+                        adom = lxml_html.fromstring(article_resp.text)
+                        # Extract page title
+                        page_title = "".join(adom.xpath('//h1//text()')).strip() or subject
+                        # Extract lead paragraphs (before first section header)
+                        paras = []
+                        for p in adom.xpath('//div[@id="mw-content-text"]//p[not(ancestor::table)]'):
+                            text = p.text_content().strip()
+                            # Skip short/empty paragraphs and citation-only lines
+                            text = re.sub(r'\[\d+\]', '', text).strip()
+                            if len(text) > 60:
+                                paras.append(text)
+                            if sum(len(x) for x in paras) >= 1000:
+                                break
+                        if paras:
+                            extract = " ".join(paras)[:1200]
+                            if len(" ".join(paras)) > 1200:
+                                extract += "…"
+                            kiwix_article_url = kiwix_url + href
+                            lines = [f"📖 **{page_title}** _(via local Kiwix)_", ""]
+                            lines.append(extract)
+                            lines.append(f"\n<{kiwix_article_url}>")
+                            return "\n".join(lines)
+    except Exception:
+        pass  # Fall through to Wikipedia REST API
+
+    # --- Fallback: Wikipedia REST API ---
     title = subject.strip().replace(" ", "_")
     url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             resp = await client.get(url, headers={"User-Agent": "mad-lab-bot/1.0"})
             if resp.status_code == 404:
-                # Try search API to find closest match
                 search_resp = await client.get(
                     "https://en.wikipedia.org/w/api.php",
                     params={
@@ -361,17 +407,16 @@ async def _cmd_wikipedia(raw: str) -> str:
     except Exception as e:
         return f"❌ Wikipedia fetch failed: {e}"
 
-    page_title   = data.get("title", subject)
-    extract      = data.get("extract", "")
-    wiki_url     = data.get("content_urls", {}).get("desktop", {}).get("page", "")
-    description  = data.get("description", "")
+    page_title  = data.get("title", subject)
+    extract     = data.get("extract", "")
+    wiki_url    = data.get("content_urls", {}).get("desktop", {}).get("page", "")
+    description = data.get("description", "")
 
     lines = [f"📖 **{page_title}**"]
     if description:
         lines.append(f"_{description}_")
     lines.append("")
     if extract:
-        # Cap at ~1200 chars so it fits cleanly in Discord
         lines.append(extract[:1200] + ("…" if len(extract) > 1200 else ""))
     if wiki_url:
         lines.append(f"\n<{wiki_url}>")

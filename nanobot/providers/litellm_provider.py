@@ -41,11 +41,13 @@ class LiteLLMProvider(LLMProvider):
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
         suppress_tools_param: bool = False,
+        request_timeout: int | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self.suppress_tools_param = suppress_tools_param
+        self.request_timeout = request_timeout
 
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
@@ -279,6 +281,9 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
+        if self.request_timeout is not None:
+            kwargs["timeout"] = self.request_timeout
+
         try:
             response = await acompletion(**kwargs)
             return self._parse_response(response)
@@ -318,6 +323,8 @@ class LiteLLMProvider(LLMProvider):
             args = tc.function.arguments
             if isinstance(args, str):
                 args = json_repair.loads(args)
+            if not isinstance(args, dict):
+                args = {}
 
             provider_specific_fields = getattr(tc, "provider_specific_fields", None) or None
             function_provider_specific_fields = (
@@ -341,8 +348,14 @@ class LiteLLMProvider(LLMProvider):
 
         # Fallback: some models (e.g. Qwen via Ollama/vLLM) embed tool-call JSON
         # in the text content instead of the structured tool_calls field.
-        if tool_calls is None and content:
-            tool_calls, content = LiteLLMProvider._extract_text_tool_calls(content)
+        # Strip <think>...</think> blocks first — thinking models (e.g. Qwen3 with
+        # thinking=1) embed reasoning in content; tool calls appear after the block.
+        if not tool_calls and content:
+            import re as _re
+            stripped = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+            tool_calls, extracted_content = LiteLLMProvider._extract_text_tool_calls(stripped)
+            if tool_calls:
+                content = extracted_content
 
         # Strip EOS/EOT tokens that some models (e.g. Ministral via llama.cpp) leak
         # into response content. If stored in history they break Jinja chat templating
@@ -374,7 +387,67 @@ class LiteLLMProvider(LLMProvider):
         """
         import re
 
-        # Try XML format: <tool_call><function=name><parameter=key>value</parameter>...</function></tool_call>
+        # Try Qwen3 format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+        qwen_calls = []
+        for qwen_match in re.finditer(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL):
+            try:
+                obj = json_repair.loads(qwen_match.group(1).strip())
+                if isinstance(obj, dict) and isinstance(obj.get("name"), str) and isinstance(obj.get("arguments"), dict):
+                    qwen_calls.append(ToolCallRequest(id=_short_tool_id(), name=obj["name"], arguments=obj["arguments"]))
+            except Exception:
+                pass
+        if qwen_calls:
+            first = re.search(r"<tool_call>", content)
+            preamble = (content[:first.start()].strip() if first else None) or None
+            logger.info("_parse_response: extracted {} Qwen3-embedded tool call(s): {}",
+                        len(qwen_calls), [c.name for c in qwen_calls])
+            return qwen_calls, preamble
+
+        # Try [TOOL_CALLS]name[ARGS]{json} format (Nemotron/Orchestrator models)
+        # Don't regex-match the JSON body — find the opening { and let json_repair
+        # consume as much as it needs. This handles large result strings with } inside.
+        tc_calls = []
+        for tc_match in re.finditer(r"\[TOOL_CALLS\]([\w_\-]+)\[ARGS\](\{)", content, re.DOTALL):
+            try:
+                json_start = tc_match.start(2)
+                args = json_repair.loads(content[json_start:])
+                if not isinstance(args, dict):
+                    args = {}
+                tc_calls.append(ToolCallRequest(id=_short_tool_id(), name=tc_match.group(1).strip(), arguments=args))
+            except Exception:
+                pass
+        if tc_calls:
+            first = re.search(r"\[TOOL_CALLS\]", content)
+            preamble = (content[:first.start()].strip() if first else None) or None
+            logger.info("_parse_response: extracted {} [TOOL_CALLS]-format tool call(s): {}",
+                        len(tc_calls), [c.name for c in tc_calls])
+            return tc_calls, preamble
+
+        # Try Python code-block format: ```python\ntool_name(arg="value")\n```
+        import ast as _ast
+        py_block_match = re.search(r"```(?:python)?\s*\n?([\w_]+\(.*?\))\s*\n?```", content, re.DOTALL)
+        if py_block_match:
+            call_src = py_block_match.group(1).strip()
+            fn_match = re.match(r"([\w_]+)\((.*)\)$", call_src, re.DOTALL)
+            if fn_match:
+                fn_name = fn_match.group(1)
+                args_src = fn_match.group(2).strip()
+                try:
+                    # Parse as keyword args only: key="val", key2=123, ...
+                    dummy = f"_f({args_src})"
+                    tree = _ast.parse(dummy, mode="eval")
+                    arguments = {}
+                    for kw in tree.body.keywords:  # type: ignore[attr-defined]
+                        if kw.arg:
+                            arguments[kw.arg] = _ast.literal_eval(kw.value)
+                    py_call = ToolCallRequest(id=_short_tool_id(), name=fn_name, arguments=arguments)
+                    preamble = content[:py_block_match.start()].strip() or None
+                    logger.info("_parse_response: extracted Python code-block tool call: {}", fn_name)
+                    return [py_call], preamble
+                except Exception:
+                    pass
+
+        # Try legacy XML format: <tool_call><function=name><parameter=key>value</parameter>...</function></tool_call>
         # Model may omit closing </function> tag, so match up to </tool_call> or end of string.
         xml_match = re.search(r"<tool_call>", content)
         if xml_match:

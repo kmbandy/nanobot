@@ -41,6 +41,14 @@ class ToolRegistry:
 
         tool = self._tools.get(name)
         if not tool:
+            # Models often output underscores where registered names use hyphens.
+            # Try normalizing hyphens→underscores in registered names and retry.
+            normalized = name.replace("-", "_")
+            tool = next(
+                (t for k, t in self._tools.items() if k.replace("-", "_") == normalized),
+                None,
+            )
+        if not tool:
             return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
 
         try:
