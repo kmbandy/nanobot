@@ -438,6 +438,7 @@ def _make_provider(config: Config):
             extra_headers=p.extra_headers if p else None,
             provider_name=provider_name,
             suppress_tools_param=p.suppress_tools_param if p else False,
+            request_timeout=p.request_timeout if p else None,
         )
 
     defaults = config.agents.defaults

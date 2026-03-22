@@ -75,6 +75,13 @@ class DiscordChannel(BaseChannel):
                 break
             except Exception as e:
                 logger.warning("Discord gateway error: {}", e)
+                # Non-recoverable close codes — retrying will never help.
+                err_str = str(e)
+                fatal_codes = ("4004", "4010", "4011", "4012", "4013", "4014")
+                if any(code in err_str for code in fatal_codes):
+                    logger.error("Discord fatal error ({}), stopping reconnect loop.", err_str[:80])
+                    self._running = False
+                    break
                 if self._running:
                     logger.info("Reconnecting to Discord gateway in 5 seconds...")
                     await asyncio.sleep(5)
