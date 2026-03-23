@@ -52,7 +52,7 @@ async def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> N
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    messages = await builder.build_messages(
+    messages = builder.build_messages(
         history=[],
         current_message="Return exactly: OK",
         channel="cli",

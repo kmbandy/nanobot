@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
+from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import _make_provider, app
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
@@ -137,10 +138,10 @@ def test_onboard_help_shows_workspace_and_config_options():
 def test_onboard_interactive_discard_does_not_save_or_create_workspace(mock_paths, monkeypatch):
     config_file, workspace_dir, _ = mock_paths
 
-    from nanobot.cli.onboard_wizard import OnboardResult
+    from nanobot.cli.onboard import OnboardResult
 
     monkeypatch.setattr(
-        "nanobot.cli.onboard_wizard.run_onboard",
+        "nanobot.cli.onboard.run_onboard",
         lambda initial_config: OnboardResult(config=initial_config, should_save=False),
     )
 
@@ -178,10 +179,10 @@ def test_onboard_wizard_preserves_explicit_config_in_next_steps(tmp_path, monkey
     config_path = tmp_path / "instance" / "config.json"
     workspace_path = tmp_path / "workspace"
 
-    from nanobot.cli.onboard_wizard import OnboardResult
+    from nanobot.cli.onboard import OnboardResult
 
     monkeypatch.setattr(
-        "nanobot.cli.onboard_wizard.run_onboard",
+        "nanobot.cli.onboard.run_onboard",
         lambda initial_config: OnboardResult(config=initial_config, should_save=True),
     )
     monkeypatch.setattr("nanobot.channels.registry.discover_all", lambda: {})
@@ -211,6 +212,15 @@ def test_config_matches_openai_codex_with_hyphen_prefix():
     config.agents.defaults.model = "openai-codex/gpt-5.1-codex"
 
     assert config.get_provider_name() == "openai_codex"
+
+
+def test_config_dump_excludes_oauth_provider_blocks():
+    config = Config()
+
+    providers = config.model_dump(by_alias=True)["providers"]
+
+    assert "openaiCodex" not in providers
+    assert "githubCopilot" not in providers
 
 
 def test_config_matches_explicit_ollama_prefix_without_api_key():
@@ -336,7 +346,9 @@ def mock_agent_runtime(tmp_path):
 
         agent_loop = MagicMock()
         agent_loop.channels_config = None
-        agent_loop.process_direct = AsyncMock(return_value="mock-response")
+        agent_loop.process_direct = AsyncMock(
+            return_value=OutboundMessage(channel="cli", chat_id="direct", content="mock-response"),
+        )
         agent_loop.close_mcp = AsyncMock(return_value=None)
         mock_agent_loop_cls.return_value = agent_loop
 
@@ -373,7 +385,9 @@ def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_
         mock_agent_runtime["config"].workspace_path
     )
     mock_agent_runtime["agent_loop"].process_direct.assert_awaited_once()
-    mock_agent_runtime["print_response"].assert_called_once_with("mock-response", render_markdown=True)
+    mock_agent_runtime["print_response"].assert_called_once_with(
+        "mock-response", render_markdown=True, metadata={},
+    )
 
 
 def test_agent_uses_explicit_config_path(mock_agent_runtime, tmp_path: Path):
@@ -409,8 +423,8 @@ def test_agent_config_sets_active_path(monkeypatch, tmp_path: Path) -> None:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def process_direct(self, *_args, **_kwargs) -> str:
-            return "ok"
+        async def process_direct(self, *_args, **_kwargs):
+            return OutboundMessage(channel="cli", chat_id="direct", content="ok")
 
         async def close_mcp(self) -> None:
             return None
@@ -461,6 +475,12 @@ def test_agent_hints_about_deprecated_memory_window(mock_agent_runtime, tmp_path
     assert result.exit_code == 0
     assert "memoryWindow" in result.stdout
     assert "no longer used" in result.stdout
+
+
+def test_heartbeat_retains_recent_messages_by_default():
+    config = Config()
+
+    assert config.gateway.heartbeat.keep_recent_messages == 8
 
 
 def test_gateway_uses_workspace_from_config_by_default(monkeypatch, tmp_path: Path) -> None:
@@ -596,3 +616,9 @@ def test_gateway_cli_port_overrides_configured_port(monkeypatch, tmp_path: Path)
 
     assert isinstance(result.exception, _StopGatewayError)
     assert "port 18792" in result.stdout
+
+
+def test_channels_login_requires_channel_name() -> None:
+    result = runner.invoke(app, ["channels", "login"])
+
+    assert result.exit_code == 2
