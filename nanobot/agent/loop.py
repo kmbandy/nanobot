@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
-import sys
-from contextlib import AsyncExitStack
+import os
+import time
+from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -28,6 +28,7 @@ from nanobot.agent.tools.sysmon import SysmonTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.config.schema import CfCrawlConfig
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
@@ -1259,6 +1260,8 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.sysmon = sysmon
+        self._start_time = time.time()
+        self._last_usage: dict[str, int] = {}
 
         self.context = ContextBuilder(
             workspace=workspace,
@@ -1288,9 +1291,13 @@ class AgentLoop:
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
-        self._processing_lock = asyncio.Lock()
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
+        _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
+        self._concurrency_gate: asyncio.Semaphore | None = (
+            asyncio.Semaphore(_max) if _max > 0 else None
+        )
 
-        # Use custom memory settings if provided (stored for potential future use)
         self.memory_max_chars = memory_max_chars or 8000
         self.memory_max_tokens = memory_max_tokens or 2000
         self.memory_compaction_enabled = memory_compaction_enabled if memory_compaction_enabled is not None else True
@@ -1304,9 +1311,13 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=provider.generation.max_tokens,
         )
 
         self._register_default_tools()
+        self.commands = CommandRouter()
+        register_builtin_commands(self.commands)
+        self._register_fleet_commands()
 
         # Register CfCrawlTool if config provided
         if cf_crawl_config:
@@ -1339,6 +1350,171 @@ class AgentLoop:
         ))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+    def _register_fleet_commands(self) -> None:
+        """Register custom fleet slash/bang commands with the CommandRouter."""
+        from nanobot.bus.events import OutboundMessage
+
+        def _reply(ctx, content: str, metadata: dict | None = None) -> OutboundMessage:
+            return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content, metadata=metadata or {})
+
+        async def cmd_fleet_status(ctx):
+            return _reply(ctx, await _cmd_status())
+
+        async def cmd_fleet_tasks(ctx):
+            return _reply(ctx, await _cmd_tasks())
+
+        async def cmd_fleet_ping(ctx):
+            return _reply(ctx, self._cmd_ping(ctx.msg.session_key))
+
+        async def cmd_fleet_brief(ctx):
+            return _reply(ctx, await _cmd_brief())
+
+        async def cmd_fleet_diff(ctx):
+            return _reply(ctx, _cmd_diff())
+
+        async def cmd_fleet_models(ctx):
+            return _reply(ctx, _cmd_models())
+
+        async def cmd_fleet_united(ctx):
+            return _reply(ctx, await _cmd_united())
+
+        async def cmd_fleet_help(ctx):
+            return _reply(ctx, (
+                "🐈 nanobot commands:\n"
+                "/new or !reset — Clear session history\n"
+                "/stop — Stop current task\n"
+                "/help — Show this\n"
+                "!status — Fleet GPU/RAM/agent status\n"
+                "!tasks — Pending pipeline tasks\n"
+                "!ping — Bot liveness + model + uptime\n"
+                "!brief — On-demand overnight summary\n"
+                "!restart <bot> — Restart eng-1 / eng-2 / arch-1\n"
+                "!models — List models in ~/models/\n"
+                "!mad-hot-swap <bot> <model> — Swap model\n"
+                "!new-nanobot — Interactive wizard to create a new bot\n"
+                "!united-latest — Man Utd last result, next fixture, PL table\n"
+                "!summarize <url> — Fetch and summarize any webpage\n"
+                "!gh <owner/repo> — GitHub repo info + latest release\n"
+                "!diff — Show nanobot changes since upstream sync\n"
+                "!mad-code-summary <path> — Summarize a file's purpose\n"
+                "!search <query> — Web search, 5 results, stops\n"
+                "!arxiv <query> — arxiv search, 5 papers, stops\n"
+                "!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n"
+                "!python <description> — Generate a Python script or function\n"
+                "!explain <code/concept> — Plain-English explanation\n"
+                "!mem <query> — Search your ChromaDB knowledge base\n"
+                "!wikipedia <subject> — Wikipedia summary for any subject\n"
+                "!remind <time> <msg> — e.g. !remind 20m check arch-1"
+            ), metadata={"render_as": "text"})
+
+        async def cmd_fleet_restart(ctx):
+            return _reply(ctx, _cmd_restart(ctx.raw))
+
+        async def cmd_fleet_hotswap(ctx):
+            return _reply(ctx, _cmd_hotswap(ctx.raw))
+
+        async def cmd_fleet_remind(ctx):
+            return _reply(ctx, _cmd_remind(ctx.raw))
+
+        async def cmd_fleet_mem(ctx):
+            return _reply(ctx, await _cmd_mem(ctx.raw))
+
+        async def cmd_fleet_wikipedia(ctx):
+            return _reply(ctx, await _cmd_wikipedia(ctx.raw))
+
+        async def cmd_fleet_gh(ctx):
+            return _reply(ctx, await _cmd_gh(ctx.raw))
+
+        # Content-transforming commands — modify msg.content and return None to fall through to LLM
+        async def cmd_fleet_reddit(ctx):
+            ctx.msg.content = _build_reddit_prompt(ctx.raw)
+            return None
+
+        async def cmd_fleet_search(ctx):
+            ctx.msg.content = _build_search_prompt(ctx.raw)
+            return None
+
+        async def cmd_fleet_arxiv(ctx):
+            ctx.msg.content = _build_arxiv_prompt(ctx.raw)
+            return None
+
+        async def cmd_fleet_python(ctx):
+            ctx.msg.content = _build_python_prompt(ctx.raw)
+            return None
+
+        async def cmd_fleet_explain(ctx):
+            ctx.msg.content = _build_explain_prompt(ctx.raw)
+            return None
+
+        async def cmd_fleet_summarize(ctx):
+            result = _build_summarize_prompt(ctx.raw)
+            if result is None:
+                return _reply(ctx, "❌ Failed to fetch URL. Check the address and try again.")
+            ctx.msg.content = result
+            return None
+
+        async def cmd_fleet_code_summary(ctx):
+            result = _build_code_summary_prompt(ctx.raw)
+            if result is None:
+                return _reply(ctx, "❌ Failed to read file.")
+            if isinstance(result, str) and result.startswith("__NOT_FOUND__:"):
+                fname = result.split(":", 1)[1]
+                return _reply(ctx, f"❌ File not found: `{fname}`\nTry a path relative to ~/mad-lab-mcp/ or ~/nanobot/")
+            ctx.msg.content = result
+            return None
+
+        # Wizard commands
+        async def cmd_wizard_cancel(ctx):
+            _wizard_clear()
+            return _reply(ctx, "❌ New bot wizard cancelled.")
+
+        async def cmd_wizard_start(ctx):
+            _wizard_clear()
+            _wizard_save({"step": 1})
+            return _reply(ctx, (
+                "🤖 **New nanobot wizard** — Step 1/6\n\n"
+                "What should this bot be called?\n"
+                "Use lowercase letters, numbers, hyphens (e.g. `researcher`, `eng-3`)\n\n"
+                "_(Type `cancel` at any step to abort)_"
+            ))
+
+        async def wizard_interceptor(ctx):
+            state = _wizard_load()
+            if state is None:
+                return None
+            new_state, response = _wizard_step(state, ctx.msg.content)
+            if new_state is None:
+                _wizard_clear()
+            else:
+                _wizard_save(new_state)
+            return _reply(ctx, response)
+
+        r = self.commands
+        r.exact("!status", cmd_fleet_status)
+        r.exact("!tasks", cmd_fleet_tasks)
+        r.exact("!ping", cmd_fleet_ping)
+        r.exact("!brief", cmd_fleet_brief)
+        r.exact("!diff", cmd_fleet_diff)
+        r.exact("!models", cmd_fleet_models)
+        r.exact("!united-latest", cmd_fleet_united)
+        r.exact("/help", cmd_fleet_help)
+        r.exact("!new-nanobot cancel", cmd_wizard_cancel)
+        r.exact("!new-nanobot", cmd_wizard_start)
+        r.prefix("!restart ", cmd_fleet_restart)
+        r.prefix("!mad-hot-swap ", cmd_fleet_hotswap)
+        r.prefix("!remind ", cmd_fleet_remind)
+        r.prefix("!mem ", cmd_fleet_mem)
+        r.prefix("!wikipedia ", cmd_fleet_wikipedia)
+        r.prefix("!gh ", cmd_fleet_gh)
+        r.prefix("!reddit ", cmd_fleet_reddit)
+        r.prefix("!search ", cmd_fleet_search)
+        r.prefix("!arxiv ", cmd_fleet_arxiv)
+        r.prefix("!python ", cmd_fleet_python)
+        r.prefix("!explain ", cmd_fleet_explain)
+        r.prefix("!summarize ", cmd_fleet_summarize)
+        r.prefix("!mad-code-summary ", cmd_fleet_code_summary)
+        r.intercept(wizard_interceptor)
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -1374,7 +1550,8 @@ class AgentLoop:
         """Remove <think>…</think> blocks that some models embed in content."""
         if not text:
             return None
-        return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
+        from nanobot.utils.helpers import strip_think
+        return strip_think(text) or None
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -1391,29 +1568,75 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        *,
+        channel: str = "cli",
+        chat_id: str = "direct",
+        message_id: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop."""
+        """Run the agent iteration loop.
+
+        *on_stream*: called with each content delta during streaming.
+        *on_stream_end(resuming)*: called when a streaming session finishes.
+        ``resuming=True`` means tool calls follow (spinner should restart);
+        ``resuming=False`` means this is the final response.
+        """
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+
+        # Wrap on_stream with stateful think-tag filter so downstream
+        # consumers (CLI, channels) never see <think> blocks.
+        _raw_stream = on_stream
+        _stream_buf = ""
+
+        async def _filtered_stream(delta: str) -> None:
+            nonlocal _stream_buf
+            from nanobot.utils.helpers import strip_think
+            prev_clean = strip_think(_stream_buf)
+            _stream_buf += delta
+            new_clean = strip_think(_stream_buf)
+            incremental = new_clean[len(prev_clean):]
+            if incremental and _raw_stream:
+                await _raw_stream(incremental)
 
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
 
-            response = await self.provider.chat_with_retry(
-                messages=messages,
-                tools=tool_defs,
-                model=self.model,
-            )
+            if on_stream:
+                response = await self.provider.chat_stream_with_retry(
+                    messages=messages,
+                    tools=tool_defs,
+                    model=self.model,
+                    on_content_delta=_filtered_stream,
+                )
+            else:
+                response = await self.provider.chat_with_retry(
+                    messages=messages,
+                    tools=tool_defs,
+                    model=self.model,
+                )
+
+            usage = response.usage or {}
+            self._last_usage = {
+                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+            }
 
             if response.has_tool_calls:
+                if on_stream and on_stream_end:
+                    await on_stream_end(resuming=True)
+                    _stream_buf = ""
+
                 if on_progress:
-                    thought = self._strip_think(response.content)
-                    if thought:
-                        await on_progress(thought)
+                    if not on_stream:
+                        thought = self._strip_think(response.content)
+                        if thought:
+                            await on_progress(thought)
                     tool_hint = self._tool_hint(response.tool_calls)
                     tool_hint = self._strip_think(tool_hint)
                     await on_progress(tool_hint, tool_hint=True)
@@ -1430,18 +1653,36 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                for tc in response.tool_calls:
+                    tools_used.append(tc.name)
+                    args_str = json.dumps(tc.arguments, ensure_ascii=False)
+                    logger.info("Tool call: {}({})", tc.name, args_str[:200])
+
+                # Re-bind tool context right before execution so that
+                # concurrent sessions don't clobber each other's routing.
+                self._set_tool_context(channel, chat_id, message_id)
+
+                # Execute all tool calls concurrently — the LLM batches
+                # independent calls in a single response on purpose.
+                # return_exceptions=True ensures all results are collected
+                # even if one tool is cancelled or raises BaseException.
+                results = await asyncio.gather(*(
+                    self.tools.execute(tc.name, tc.arguments)
+                    for tc in response.tool_calls
+                ), return_exceptions=True)
+
+                for tool_call, result in zip(response.tool_calls, results):
+                    if isinstance(result, BaseException):
+                        result = f"Error: {type(result).__name__}: {result}"
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
+                if on_stream and on_stream_end:
+                    await on_stream_end(resuming=False)
+                    _stream_buf = ""
+
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
-                # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
@@ -1483,51 +1724,40 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
-            cmd = msg.content.strip().lower()
-            if cmd == "/stop":
-                await self._handle_stop(msg)
-            elif cmd == "/restart":
-                await self._handle_restart(msg)
-            else:
-                task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
-
-    async def _handle_stop(self, msg: InboundMessage) -> None:
-        """Cancel all active tasks and subagents for the session."""
-        tasks = self._active_tasks.pop(msg.session_key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-        for t in tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
-        total = cancelled + sub_cancelled
-        content = f"Stopped {total} task(s)." if total else "No active task to stop."
-        await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=content,
-        ))
-
-    async def _handle_restart(self, msg: InboundMessage) -> None:
-        """Restart the process in-place via os.execv."""
-        await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content="Restarting...",
-        ))
-
-        async def _do_restart():
-            await asyncio.sleep(1)
-            # Use -m nanobot instead of sys.argv[0] for Windows compatibility
-            # (sys.argv[0] may be just "nanobot" without full path on Windows)
-            os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
-
-        asyncio.create_task(_do_restart())
+            raw = msg.content.strip()
+            if self.commands.is_priority(raw):
+                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
+                result = await self.commands.dispatch_priority(ctx)
+                if result:
+                    await self.bus.publish_outbound(result)
+                continue
+            task = asyncio.create_task(self._dispatch(msg))
+            self._active_tasks.setdefault(msg.session_key, []).append(task)
+            task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        async with self._processing_lock:
+        """Process a message: per-session serial, cross-session concurrent."""
+        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        gate = self._concurrency_gate or nullcontext()
+        async with lock, gate:
             try:
-                response = await self._process_message(msg)
+                on_stream = on_stream_end = None
+                if msg.metadata.get("_wants_stream"):
+                    async def on_stream(delta: str) -> None:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content=delta, metadata={"_stream_delta": True},
+                        ))
+
+                    async def on_stream_end(*, resuming: bool = False) -> None:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="", metadata={"_stream_end": True, "_resuming": resuming},
+                        ))
+
+                response = await self._process_message(
+                    msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                )
                 if response is not None:
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
@@ -1573,6 +1803,8 @@ class AgentLoop:
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -1585,14 +1817,16 @@ class AgentLoop:
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
-            # Subagent results should be assistant role, other system messages use user role
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages, channel=channel, chat_id=chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -1605,175 +1839,20 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
-        # Slash commands — strip leading @mention if present
-        # Discord sends "<@USER_ID> !cmd" or "<@!USER_ID> !cmd"; CLI sends "@name !cmd"
-        _content_stripped = msg.content.strip()
-        _content_stripped = re.sub(r'^<@!?\d+>\s*', '', _content_stripped)  # Discord mention
-        if _content_stripped.startswith("@"):
-            # Plain @name mention (CLI / other channels)
-            _parts = _content_stripped.split(None, 1)
-            _content_stripped = _parts[1].strip() if len(_parts) > 1 else ""
-        if _content_stripped != msg.content.strip():
-            msg.content = _content_stripped  # strip mention from LLM path too
-        cmd = _content_stripped.lower()
-        if cmd in ("/new", "/reset", "!reset"):
-            snapshot = session.messages[session.last_consolidated:]
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
+        # Strip leading @mention — Discord sends "<@USER_ID> cmd", CLI sends "@name cmd"
+        _stripped = msg.content.strip()
+        _stripped = re.sub(r'^<@!?\d+>\s*', '', _stripped)
+        if _stripped.startswith("@"):
+            _parts = _stripped.split(None, 1)
+            _stripped = _parts[1].strip() if len(_parts) > 1 else ""
+        if _stripped != msg.content.strip():
+            msg.content = _stripped
 
-            if snapshot:
-                self._schedule_background(self.memory_consolidator.archive_messages(snapshot))
-
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
-        # ── New-nanobot wizard (intercepts all messages while active) ──────────
-        if cmd == "!new-nanobot cancel":
-            _wizard_clear()
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="❌ New bot wizard cancelled.")
-
-        if cmd == "!new-nanobot":
-            _wizard_clear()
-            _wizard_save({"step": 1})
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content=(
-                                      "🤖 **New nanobot wizard** — Step 1/6\n\n"
-                                      "What should this bot be called?\n"
-                                      "Use lowercase letters, numbers, hyphens (e.g. `researcher`, `eng-3`)\n\n"
-                                      "_(Type `cancel` at any step to abort)_"
-                                  ))
-
-        _wizard_state = _wizard_load()
-        if _wizard_state is not None:
-            new_wiz_state, wiz_response = _wizard_step(_wizard_state, msg.content)
-            if new_wiz_state is None:
-                _wizard_clear()
-            else:
-                _wizard_save(new_wiz_state)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content=wiz_response)
-
-        if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new or !reset — Clear session history\n/stop — Stop current task\n/help — Show this\n!status — Fleet GPU/RAM/agent status\n!tasks — Pending pipeline tasks\n!ping — Bot liveness + model + uptime\n!brief — On-demand overnight summary\n!restart <bot> — Restart eng-1 / eng-2 / arch-1\n!models — List models in ~/models/\n!mad-hot-swap <bot> <model> — Swap model (e.g. !mad-hot-swap eng-1 qwen3.5-9b)\n!new-nanobot — Interactive wizard to create a new bot config + service files\n!united-latest — Man Utd last result, next fixture, PL table, r/ManUtd talking points\n!summarize <url> — Fetch and summarize any webpage\n!gh <owner/repo> — GitHub repo info + latest release\n!diff — Show nanobot changes since upstream sync\n!mad-code-summary <path> — Summarize a file's purpose\n!search <query> — Web search, 5 results, stops\n!arxiv <query> — arxiv search, 5 papers, stops\n!reddit <sub> <topic> — Subreddit search, 5 posts, stops\n!python <description> — Generate a Python script or function\n!explain <code/concept> — Plain-English explanation\n!mem <query> — Search your ChromaDB knowledge base\n!wikipedia <subject> — Wikipedia summary for any subject\n!remind <time> <msg> — e.g. !remind 20m check arch-1")
-
-        if cmd == "!status":
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=await _cmd_status(),
-            )
-
-        if cmd == "!tasks":
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=await _cmd_tasks(),
-            )
-
-        if cmd == "!ping":
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=self._cmd_ping(msg.session_key),
-            )
-
-        if cmd == "!brief":
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=await _cmd_brief(),
-            )
-
-        if cmd.startswith("!reddit "):
-            msg.content = _build_reddit_prompt(msg.content)
-
-        elif cmd.startswith("!search "):
-            msg.content = _build_search_prompt(msg.content)
-
-        elif cmd.startswith("!arxiv "):
-            msg.content = _build_arxiv_prompt(msg.content)
-
-        elif cmd.startswith("!python "):
-            msg.content = _build_python_prompt(msg.content)
-
-        elif cmd.startswith("!explain "):
-            msg.content = _build_explain_prompt(msg.content)
-
-        if cmd.startswith("!mem "):
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=await _cmd_mem(msg.content),
-            )
-
-        if cmd.startswith("!wikipedia "):
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=await _cmd_wikipedia(msg.content),
-            )
-
-        if cmd == "!united-latest":
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=await _cmd_united(),
-            )
-
-        if cmd == "!diff":
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=_cmd_diff(),
-            )
-
-        if cmd.startswith("!gh "):
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=await _cmd_gh(msg.content),
-            )
-
-        if cmd.startswith("!summarize "):
-            result = _build_summarize_prompt(msg.content)
-            if result is None:
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="❌ Failed to fetch URL. Check the address and try again.",
-                )
-            msg.content = result
-
-        if cmd.startswith("!mad-code-summary "):
-            result = _build_code_summary_prompt(msg.content)
-            if result is None:
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="❌ Failed to read file.",
-                )
-            if isinstance(result, str) and result.startswith("__NOT_FOUND__:"):
-                fname = result.split(":", 1)[1]
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=f"❌ File not found: `{fname}`\nTry a path relative to ~/mad-lab-mcp/ or ~/nanobot/",
-                )
-            msg.content = result
-
-        if cmd == "!models":
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=_cmd_models(),
-            )
-
-        if cmd.startswith("!mad-hot-swap "):
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=_cmd_hotswap(msg.content),
-            )
-
-        if cmd.startswith("!remind "):
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=_cmd_remind(msg.content),
-            )
-
-        elif cmd.startswith("!restart "):
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=_cmd_restart(msg.content),
-            )
+        # Slash commands via CommandRouter
+        raw = msg.content.strip()
+        ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
+        if result := await self.commands.dispatch(ctx):
+            return result
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
@@ -1799,7 +1878,12 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            on_stream=on_stream,
+            on_stream_end=on_stream_end,
+            channel=msg.channel, chat_id=msg.chat_id,
+            message_id=msg.metadata.get("message_id"),
         )
 
         if final_content is None:
@@ -1814,9 +1898,13 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+        meta = dict(msg.metadata or {})
+        if on_stream is not None:
+            meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            metadata=meta,
         )
 
     def _cmd_ping(self, session_key: str) -> str:
@@ -1835,11 +1923,9 @@ class AgentLoop:
             bot_name = "nanobot-eng-1"
             service  = "nanobot.service"
 
-        # State: any active tasks for this session?
         busy = bool(self._active_tasks.get(session_key))
         state = "🔄 working" if busy else "💤 idle"
 
-        # Service uptime via systemctl
         uptime_str = ""
         try:
             out = subprocess.check_output(
@@ -1847,11 +1933,9 @@ class AgentLoop:
                  "--property=ActiveEnterTimestamp"],
                 text=True, stderr=subprocess.DEVNULL,
             ).strip()
-            # "ActiveEnterTimestamp=Thu 2026-03-19 00:49:42 EDT"
             val = out.split("=", 1)[-1].strip()
             if val and val != "n/a":
                 from datetime import datetime, timezone
-                # Parse systemd timestamp — try common formats
                 for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S"):
                     try:
                         started = datetime.strptime(val, fmt).replace(tzinfo=timezone.utc)
@@ -1870,6 +1954,52 @@ class AgentLoop:
 
         return f"🏓 **{bot_name}** — {state} | `{self.model}`{uptime_str}"
 
+    @staticmethod
+    def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:
+        """Convert an inline image block into a compact text placeholder."""
+        path = (block.get("_meta") or {}).get("path", "")
+        return {"type": "text", "text": f"[image: {path}]" if path else "[image]"}
+
+    def _sanitize_persisted_blocks(
+        self,
+        content: list[dict[str, Any]],
+        *,
+        truncate_text: bool = False,
+        drop_runtime: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Strip volatile multimodal payloads before writing session history."""
+        filtered: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                filtered.append(block)
+                continue
+
+            if (
+                drop_runtime
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+                and block["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+            ):
+                continue
+
+            if (
+                block.get("type") == "image_url"
+                and block.get("image_url", {}).get("url", "").startswith("data:image/")
+            ):
+                filtered.append(self._image_placeholder(block))
+                continue
+
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                text = block["text"]
+                if truncate_text and len(text) > self._TOOL_RESULT_MAX_CHARS:
+                    text = text[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                filtered.append({**block, "text": text})
+                continue
+
+            filtered.append(block)
+
+        return filtered
+
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
@@ -1878,11 +2008,14 @@ class AgentLoop:
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
-            # Skip the tool call hint message added for context
-            if role == "user" and isinstance(content, str) and content.startswith("[Tool Call]"):
-                continue
-            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            if role == "tool":
+                if isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
+                    entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                elif isinstance(content, list):
+                    filtered = self._sanitize_persisted_blocks(content, truncate_text=True)
+                    if not filtered:
+                        continue
+                    entry["content"] = filtered
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.
@@ -1892,17 +2025,7 @@ class AgentLoop:
                     else:
                         continue
                 if isinstance(content, list):
-                    filtered = []
-                    for c in content:
-                        if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                            continue  # Strip runtime context from multimodal messages
-                        if (c.get("type") == "image_url"
-                                and c.get("image_url", {}).get("url", "").startswith("data:image/")):
-                            path = (c.get("_meta") or {}).get("path", "")
-                            placeholder = f"[image: {path}]" if path else "[image]"
-                            filtered.append({"type": "text", "text": placeholder})
-                        else:
-                            filtered.append(c)
+                    filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
                     if not filtered:
                         continue
                     entry["content"] = filtered
@@ -1917,9 +2040,13 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
-    ) -> str:
-        """Process a message directly (for CLI or cron usage)."""
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
+        """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
-        return response.content if response else ""
+        return await self._process_message(
+            msg, session_key=session_key, on_progress=on_progress,
+            on_stream=on_stream, on_stream_end=on_stream_end,
+        )
