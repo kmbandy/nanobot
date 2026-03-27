@@ -23,10 +23,11 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path, provider: LLMProvider | None = None, model: str | None = None,
-                 memory_max_chars: int = 8000, memory_max_tokens: int = 2000, memory_compaction_enabled: bool = True,
-                 temperature: float = 0.1):
+    def __init__(self, workspace: Path, timezone: str | None = None, provider: LLMProvider | None = None,
+                 model: str | None = None, memory_max_chars: int = 8000, memory_max_tokens: int = 2000,
+                 memory_compaction_enabled: bool = True, temperature: float = 0.1):
         self.workspace = workspace
+        self.timezone = timezone
         self.provider = provider
         self.model = model
         self.memory = MemoryStore(workspace)
@@ -174,9 +175,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST call the 'message' tool with the 'media' parameter. Do NOT use read_file to "send" a file — reading a file only shows its content to you, it does NOT deliver the file to the user. Example: message(content="Here is the file", media=["/path/to/file.png"])"""
 
     @staticmethod
-    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+    def _build_runtime_context(
+        channel: str | None, chat_id: str | None, timezone: str | None = None,
+    ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
-        lines = [f"Current Time: {current_time_str()}"]
+        lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
@@ -204,7 +207,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         current_role: str = "user",
     ) -> list[dict[str, Any]]:
         """Build the complete message list (sync, no memory compaction). For token estimation."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id)
+        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
         user_content = self._build_user_content(current_message, media)
 
         if isinstance(user_content, str):

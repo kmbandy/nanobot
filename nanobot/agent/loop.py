@@ -1241,6 +1241,7 @@ class AgentLoop:
         memory_max_tokens: int | None = None,
         memory_compaction_enabled: bool | None = None,
         sysmon: bool = True,
+        timezone: str | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -1265,6 +1266,7 @@ class AgentLoop:
 
         self.context = ContextBuilder(
             workspace=workspace,
+            timezone=timezone,
             provider=provider,
             model=self.model,
             memory_max_chars=memory_max_chars or 8000,
@@ -1349,7 +1351,9 @@ class AgentLoop:
             default_model=self.nvidia_default_model or 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
         ))
         if self.cron_service:
-            self.tools.register(CronTool(self.cron_service))
+            self.tools.register(
+                CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
+            )
 
     def _register_fleet_commands(self) -> None:
         """Register custom fleet slash/bang commands with the CommandRouter."""
@@ -1743,17 +1747,35 @@ class AgentLoop:
             try:
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
+                    # Split one answer into distinct stream segments.
+                    stream_base_id = f"{msg.session_key}:{time.time_ns()}"
+                    stream_segment = 0
+
+                    def _current_stream_id() -> str:
+                        return f"{stream_base_id}:{stream_segment}"
+
                     async def on_stream(delta: str) -> None:
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
-                            content=delta, metadata={"_stream_delta": True},
+                            content=delta,
+                            metadata={
+                                "_stream_delta": True,
+                                "_stream_id": _current_stream_id(),
+                            },
                         ))
 
                     async def on_stream_end(*, resuming: bool = False) -> None:
+                        nonlocal stream_segment
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata={"_stream_end": True, "_resuming": resuming},
+                            content="",
+                            metadata={
+                                "_stream_end": True,
+                                "_resuming": resuming,
+                                "_stream_id": _current_stream_id(),
+                            },
                         ))
+                        stream_segment += 1
 
                 response = await self._process_message(
                     msg, on_stream=on_stream, on_stream_end=on_stream_end,
