@@ -680,6 +680,40 @@ class OpenAICompatProvider(LLMProvider):
                 logger.info("_extract_text_tool_calls: extracted {} XML tool call(s): {}", len(calls), [c.name for c in calls])
                 return calls, content[:xml_match.start()].strip() or None
 
+        # BitAgent format: [tool_name(param=value, param2=value2)]
+        bitagent_calls = []
+        for m in re.finditer(r"\[(\w[\w_\-]*)\(([^]]*)\)\]", content):
+            name = m.group(1).strip()
+            raw_args = m.group(2).strip()
+            arguments: dict = {}
+            if raw_args:
+                for pair in re.finditer(r"(\w+)\s*=\s*(['\"]?)(.*?)\2(?:,|$)", raw_args):
+                    arguments[pair.group(1)] = pair.group(3).strip()
+            bitagent_calls.append(ToolCallRequest(id=_short_tool_id(), name=name, arguments=arguments))
+        if bitagent_calls:
+            first = re.search(r"\[[\w][\w_\-]*\(", content)
+            preamble = (content[:first.start()].strip() if first else None) or None
+            logger.info("_extract_text_tool_calls: extracted {} BitAgent tool call(s): {}", len(bitagent_calls), [c.name for c in bitagent_calls])
+            return bitagent_calls, preamble
+
+        # Salesforce/Command-R format: {"thought": "...", "tool_calls": [{"name": "...", "arguments": {...}}]}
+        thought_match = re.search(r"\{", content)
+        if thought_match:
+            try:
+                parsed = json_repair.loads(content[thought_match.start():].strip())
+                if isinstance(parsed, dict) and isinstance(parsed.get("tool_calls"), list):
+                    sf_calls = [
+                        ToolCallRequest(id=_short_tool_id(), name=obj["name"].replace(" ", ""), arguments=obj.get("arguments", {}))
+                        for obj in parsed["tool_calls"]
+                        if isinstance(obj, dict) and isinstance(obj.get("name"), str)
+                    ]
+                    if sf_calls:
+                        preamble = content[:thought_match.start()].strip() or None
+                        logger.info("_extract_text_tool_calls: extracted {} Salesforce tool call(s): {}", len(sf_calls), [c.name for c in sf_calls])
+                        return sf_calls, preamble
+            except Exception:
+                pass
+
         # Raw JSON fallback
         match = re.search(r"[{\[]", content)
         if not match:
@@ -690,7 +724,7 @@ class OpenAICompatProvider(LLMProvider):
             return [], content
         candidates = parsed if isinstance(parsed, list) else [parsed]
         calls = [
-            ToolCallRequest(id=_short_tool_id(), name=obj["name"], arguments=obj["arguments"])
+            ToolCallRequest(id=_short_tool_id(), name=obj["name"].replace(" ", ""), arguments=obj["arguments"])
             for obj in candidates
             if isinstance(obj, dict) and isinstance(obj.get("name"), str) and isinstance(obj.get("arguments"), dict)
         ]

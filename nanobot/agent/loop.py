@@ -1242,6 +1242,7 @@ class AgentLoop:
         memory_compaction_enabled: bool | None = None,
         sysmon: bool = True,
         timezone: str | None = None,
+        bot_name: str = "",
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -1249,6 +1250,13 @@ class AgentLoop:
         self.channels_config = channels_config
         self.provider = provider
         self.workspace = workspace
+        # Derive bot name from workspace path if not provided
+        # e.g. ~/.nanobot-8b/workspace -> .nanobot-8b -> nanobot-8b
+        if bot_name:
+            self._bot_name = bot_name
+        else:
+            parent = Path(workspace).parent.name  # e.g. ".nanobot-8b"
+            self._bot_name = parent.lstrip(".") or "nanobot-unknown"
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
@@ -1568,6 +1576,38 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    async def _capture_tool_error(
+        self,
+        tool_name: str,
+        arguments: Any,
+        error_text: str,
+    ) -> None:
+        """Fire-and-forget: POST tool execution errors to mad-lab-mcp for recurrence tracking."""
+        import urllib.request as _req
+        try:
+            args_snippet = ""
+            if isinstance(arguments, dict):
+                val = next(iter(arguments.values()), "")
+                if isinstance(val, str):
+                    args_snippet = val[:150]
+            payload = json.dumps({
+                "event": "ToolError",
+                "bot": self._bot_name,
+                "tool_name": tool_name,
+                "error": error_text[:600],
+                "args_snippet": args_snippet,
+            }).encode()
+            req = _req.Request(
+                "http://127.0.0.1:18800/hook",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _req.urlopen(req, timeout=3):
+                pass
+        except Exception:
+            pass  # Never let error capture break the agent loop
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -1677,7 +1717,11 @@ class AgentLoop:
 
                 for tool_call, result in zip(response.tool_calls, results):
                     if isinstance(result, BaseException):
-                        result = f"Error: {type(result).__name__}: {result}"
+                        error_text = f"Error: {type(result).__name__}: {result}"
+                        asyncio.create_task(self._capture_tool_error(
+                            tool_call.name, tool_call.arguments, error_text,
+                        ))
+                        result = error_text
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
